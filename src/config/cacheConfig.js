@@ -7,7 +7,7 @@
  * env configuration.
  *
  * Environment variables (all in milliseconds):
- *   CACHE_TTL_NETWORK_STATUS_MS  — /network-status            (default: 5 000 ms)
+ *   CACHE_TTL_NETWORK_STATUS_MS  — /network-status            (default: 10 000 ms)
  *   CACHE_TTL_FEE_ESTIMATE_MS    — /fee-estimate & surge-status (default: 5 000 ms)
  *   CACHE_TTL_BASE_FEE_MS        — /network/base-fee          (default: 5 000 ms)
  *   CACHE_TTL_VALIDATORS_MS      — /network/validators        (default: 300 000 ms)
@@ -18,6 +18,8 @@
  *   CACHE_TTL_SIGNING_KEYS_MS   — /account/:id/signing-keys     (default: 20 000 ms)
  *   CACHE_TTL_FREEZE_CHECK_MS   — /account/:id/freeze-status     (default: 30 000 ms)
  *   CACHE_TTL_BALANCES_BY_SPONSOR_MS — /claimable-balances/by-sponsor (default: 30 000 ms)
+ *   CACHE_TTL_FREEZE_CHECK_MS   — /account/:id/freeze-status     (default: 30 000 ms)
+ *   CACHE_TTL_SIGNING_KEYS_MS   — /account/:id/signing-keys      (default: 20 000 ms)
  *
  * The legacy CACHE_TTL_MS variable is still respected as a global fallback so
  * existing deployments are not broken.
@@ -31,10 +33,10 @@ function msToSeconds(ms, defaultMs) {
 const globalFallbackMs = parseInt(process.env.CACHE_TTL_MS, 10) || 5000;
 
 const cacheTTL = {
-  /** /network-status — one ledger close interval */
+  /** /network-status — live Horizon root payload, 10 s default */
   networkStatus: msToSeconds(
     process.env.CACHE_TTL_NETWORK_STATUS_MS,
-    globalFallbackMs
+    parseInt(process.env.CACHE_TTL_MS, 10) || 10000
   ),
 
   /** /fee-estimate and /fee-estimate/surge-status */
@@ -85,6 +87,12 @@ const cacheTTL = {
     15000
   ),
 
+  /** /account/:id/liquidity-contribution — aggregated pool positions, same volatility as pool-positions */
+  liquidityContribution: msToSeconds(
+    process.env.CACHE_TTL_LIQUIDITY_CONTRIBUTION_MS,
+    15000
+  ),
+
   /** /account/:id/transaction-count — changes only on new submissions */
   transactionCount: msToSeconds(
     process.env.CACHE_TTL_TX_COUNT_MS,
@@ -95,6 +103,12 @@ const cacheTTL = {
   topMarkets: msToSeconds(
     process.env.CACHE_TTL_TOP_MARKETS_MS,
     60000
+  ),
+
+  /** /dex/volume-leaders — 24h asset volume ranking, refresh every 5 min by default */
+  volumeLeaders: msToSeconds(
+    process.env.CACHE_TTL_VOLUME_LEADERS_MS,
+    300000
   ),
 
   /** /dex/arbitrage — market conditions change rapidly, short TTL by default */
@@ -121,6 +135,12 @@ const cacheTTL = {
     10000
   ),
 
+  /** /soroban/contract/:id/storage — instance storage entries */
+  contractStorage: msToSeconds(
+    process.env.CACHE_TTL_CONTRACT_STORAGE_MS,
+    15000
+  ),
+
   /** /account/:id/trades — trade history per account */
   trades: msToSeconds(
     process.env.CACHE_TTL_TRADES_MS,
@@ -131,6 +151,30 @@ const cacheTTL = {
   poolTrades: msToSeconds(
     process.env.CACHE_TTL_POOL_TRADES_MS,
     globalFallbackMs
+  ),
+
+  /** /account/:id/freeze-status — changes only when issuer modifies auth flags */
+  freezeCheck: msToSeconds(
+    process.env.CACHE_TTL_FREEZE_CHECK_MS,
+    30000
+  ),
+
+  /** /account/:id/signing-keys — changes only when account modifies signers */
+  signingKeys: msToSeconds(
+    process.env.CACHE_TTL_SIGNING_KEYS_MS,
+    20000
+  ),
+
+  /** /soroban/contract/:id/storage — instance storage changes only on invoke */
+  contractStorage: msToSeconds(
+    process.env.CACHE_TTL_CONTRACT_STORAGE_MS,
+    15000
+  ),
+
+  /** /soroban/contract/:id/functions — contract ABI is immutable per WASM hash */
+  contractFunctions: msToSeconds(
+    process.env.CACHE_TTL_CONTRACT_FUNCTIONS_MS,
+    60000
   ),
 };
 

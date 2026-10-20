@@ -86,6 +86,20 @@ beforeEach(() => {
 });
 
 describe("GET /network/fee-percentiles", () => {
+  function collectKeys(value, keys = new Set()) {
+    if (Array.isArray(value)) {
+      value.forEach((item) => collectKeys(item, keys));
+      return keys;
+    }
+    if (value && typeof value === "object") {
+      for (const [k, v] of Object.entries(value)) {
+        keys.add(k);
+        collectKeys(v, keys);
+      }
+    }
+    return keys;
+  }
+
   it("returns success with correct shape", async () => {
     mockServer();
     const res = await request(app).get("/network/fee-percentiles");
@@ -93,9 +107,53 @@ describe("GET /network/fee-percentiles", () => {
     expect(res.body.success).toBe(true);
     const data = res.body.data;
     expect(data).toHaveProperty("percentiles");
+    expect(data).toHaveProperty("baseFee");
     expect(data).toHaveProperty("minFee");
     expect(data).toHaveProperty("maxFee");
     expect(data).toHaveProperty("ledgerSequence");
+    expect(data).toHaveProperty("timestamp");
+  });
+
+  it("baseFee has stroops and seven-decimal xlm", async () => {
+    mockServer();
+    const res = await request(app).get("/network/fee-percentiles");
+    const { baseFee } = res.body.data;
+    expect(baseFee).toEqual({ stroops: 100, xlm: "0.0000100" });
+    expect(baseFee.xlm).toMatch(/^\d+\.\d{7}$/);
+  });
+
+  it("timestamp is an ISO 8601 string", async () => {
+    mockServer();
+    const res = await request(app).get("/network/fee-percentiles");
+    const { timestamp } = res.body.data;
+    expect(typeof timestamp).toBe("string");
+    expect(timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(new Date(timestamp).toISOString()).toBe(timestamp);
+  });
+
+  it("contains no snake_case field names", async () => {
+    mockServer();
+    const res = await request(app).get("/network/fee-percentiles");
+    const keys = [...collectKeys(res.body.data)];
+    for (const key of keys) {
+      expect(key).not.toMatch(/_/);
+    }
+    expect(keys).not.toContain("fee_charged");
+    expect(keys).not.toContain("fee_accepted");
+    expect(keys).not.toContain("last_ledger_base_fee");
+    expect(keys).not.toContain("ledger_capacity_usage");
+  });
+
+  it("all fee fields are present in both stroops and XLM", async () => {
+    mockServer();
+    const res = await request(app).get("/network/fee-percentiles");
+    const { percentiles, baseFee, minFee, maxFee } = res.body.data;
+    const feeObjects = [...Object.values(percentiles), baseFee, minFee, maxFee];
+    for (const fee of feeObjects) {
+      expect(typeof fee.stroops).toBe("number");
+      expect(Number.isInteger(fee.stroops)).toBe(true);
+      expect(fee.xlm).toMatch(/^\d+\.\d{7}$/);
+    }
   });
 
   it("returns all required percentile levels", async () => {

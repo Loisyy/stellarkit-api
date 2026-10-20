@@ -10,9 +10,16 @@ const { assetHoldersRateLimiter } = require("../middleware/rateLimiter");
 const normalizeAssetCode = require("../middleware/normalizeAssetCode");
 const { validateAccountId, validateAssetCode, validateAsset, validateLimit } = require("../utils/validators");
 const { parsePaginationParams } = require("../utils/pagination");
-const { makeAssetNotFoundError } = require("../utils/errors");
+const {
+  makeAssetNotFoundError,
+  makeAccountNotFoundError,
+  makeTomlFetchFailedError,
+  makeOrderBookEmptyError,
+} = require("../utils/errors");
 const cacheTTL = require("../config/cacheConfig");
-const { normalizeAsset } = require("../utils/asset");
+const { normalizeAsset, normalizeAssetFromString } = require("../utils/asset");
+const { fetchNormalisedToml } = require("../utils/tomlResolver");
+const { isNativeAsset } = require("../utils/assetHelpers");
 router.use(normalizeAssetCode);
 
 const DEFAULT_ASSET_HOLDERS_CACHE_TTL_MS = 30000;
@@ -53,9 +60,7 @@ function formatAssetHolder(account, assetCode, issuer) {
 }
 
 function getNativeBalance(account) {
-  const native = (account.balances || []).find(
-    (b) => b.asset_type === "native",
-  );
+  const native = (account.balances || []).find((b) => isNativeAsset(b));
   return native ? parseFloat(native.balance) : 0;
 }
 
@@ -125,7 +130,7 @@ router.get(
       const assetCode = code.toUpperCase();
       const { limit, order, cursor } = parsePaginationParams(req.query);
 
-      const fresh = req.query.fresh === "true";
+      const fresh = req.query.fresh === true || req.query.fresh === "true";
       const minBalance = parseNonNegativeDecimalQueryParam(
         req.query.minBalance,
         "minBalance",
@@ -201,7 +206,7 @@ router.get(
       const nextCursor = lastRecord ? lastRecord.paging_token : null;
 
       const meta = {
-        count: filteredHolders.length,
+        total: filteredHolders.length,
         limit,
         order,
         nextCursor,
@@ -312,6 +317,7 @@ router.get("/:code/:issuer/distribution", async (req, res, next) => {
     validateAsset(code, issuer);
 
     const assetCode = code.toUpperCase();
+    const topLimit = req.query.limit !== undefined ? validateLimit(req.query.limit, 200) : 10;
 
     // 1. Verify asset exists and get total holder count
     const assetsResponse = await server
@@ -328,8 +334,6 @@ router.get("/:code/:issuer/distribution", async (req, res, next) => {
     const totalHolders = asset.num_accounts;
 
     // 2. Fetch top holders (up to 200)
-    // Note: Horizon doesn't allow sorting /accounts by balance.
-    // We fetch a page of accounts holding the asset.
     const accountsResponse = await server
       .accounts()
       .forAsset(new Asset(assetCode, issuer))
@@ -340,22 +344,31 @@ router.get("/:code/:issuer/distribution", async (req, res, next) => {
     if (records.length === 0) {
       return success(res, {
         totalHolders: 0,
+        topHolders: [],
+        distributionStats: { top10HoldersPercent: 0, top25HoldersPercent: 0, largestHolder: null, smallestHolder: null },
+        giniCoefficient: 0,
         top10HoldersPercent: 0,
         top25HoldersPercent: 0,
-        giniCoefficient: 0,
         largestHolder: null,
         smallestHolder: null,
       });
     }
 
-    // Extract balances and sort descending
-    const balances = records.map(r => {
+    // Extract holders with balance, sort descending
+    const holdersData = records.map(r => {
       const b = r.balances.find(bal => bal.asset_code === assetCode && bal.asset_issuer === issuer);
-      return parseFloat(b ? b.balance : "0");
-    }).sort((a, b) => b - a);
+      return { address: r.id, balanceNum: parseFloat(b ? b.balance : "0") };
+    }).sort((a, b) => b.balanceNum - a.balanceNum);
 
+    const balances = holdersData.map(h => h.balanceNum);
     const totalInFetched = balances.reduce((sum, b) => sum + b, 0);
     const totalAssetSupply = parseFloat(asset.amount || "0");
+
+    // topHolders array limited by ?limit=
+    const topHolders = holdersData.slice(0, topLimit).map(h => ({
+      address: h.address,
+      balance: toSevenDecimalString(h.balanceNum),
+    }));
 
     // Concentration metrics relative to total supply
     const top10Sum = balances.slice(0, 10).reduce((sum, b) => sum + b, 0);
@@ -368,9 +381,10 @@ router.get("/:code/:issuer/distribution", async (req, res, next) => {
       ? parseFloat(((top25Sum / totalAssetSupply) * 100).toFixed(2))
       : 0;
 
-    // Gini Coefficient Calculation (using the fetched set)
-    // G = (2 * sum(i * x_i) / (n * sum(x_i))) - ((n + 1) / n)
-    // where x_i is sorted ASCENDING
+    const largestHolder = holdersData[0]?.address || null;
+    const smallestHolder = holdersData[holdersData.length - 1]?.address || null;
+
+    // Gini Coefficient
     const n = balances.length;
     const sortedAsc = [...balances].sort((a, b) => a - b);
     let cumulativeSum = 0;
@@ -385,18 +399,67 @@ router.get("/:code/:issuer/distribution", async (req, res, next) => {
 
     return success(res, {
       totalHolders,
+      topHolders,
+      distributionStats: { top10HoldersPercent, top25HoldersPercent, largestHolder, smallestHolder },
+      giniCoefficient,
       top10HoldersPercent,
       top25HoldersPercent,
-      giniCoefficient,
-      largestHolder: records.find(r => {
-        const b = r.balances.find(bal => bal.asset_code === assetCode && bal.asset_issuer === issuer);
-        return parseFloat(b ? b.balance : "0") === balances[0];
-      })?.id || null,
-      smallestHolder: records.find(r => {
-        const b = r.balances.find(bal => bal.asset_code === assetCode && bal.asset_issuer === issuer);
-        return parseFloat(b ? b.balance : "0") === balances[balances.length - 1];
-      })?.id || null,
+      largestHolder,
+      smallestHolder,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /asset/:code/:issuer/liquidity-pools
+ * Lists the liquidity pools that contain the specified asset.
+ *
+ * Query params:
+ *   limit  (number, 1–100, default: 20)
+ *   cursor (string) — paging token from a previous response
+ *
+ * Use `XLM/native` for the native asset.
+ *
+ * @example
+ * GET /asset/USDC/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/liquidity-pools?limit=10
+ */
+router.get("/:code/:issuer/liquidity-pools", async (req, res, next) => {
+  try {
+    const { code, issuer } = req.params;
+    const isNative = code.toUpperCase() === "XLM" && issuer.toLowerCase() === "native";
+    if (!isNative) validateAsset(code, issuer);
+
+    const assetCode = code.toUpperCase();
+    const asset = isNative ? Asset.native() : new Asset(assetCode, issuer);
+    const assetString = isNative ? "native" : `${assetCode}:${issuer}`;
+    const { limit, cursor } = parsePaginationParams(req.query);
+
+    let query = server.liquidityPools().forAssets(asset).limit(limit);
+    if (cursor) query = query.cursor(cursor);
+    const response = await query.call();
+    const records = response.records || [];
+
+    const formatReserve = (r) => ({
+      asset: normalizeAssetFromString(r.asset),
+      amount: toSevenDecimalString(r.amount),
+    });
+
+    const pools = records
+      .filter((p) => (p.reserves || []).some((r) => r.asset === assetString))
+      .map((p) => ({
+        poolId: p.id,
+        fee: p.fee_bp,
+        totalShares: toSevenDecimalString(p.total_shares),
+        reserveA: formatReserve(p.reserves[0]),
+        reserveB: formatReserve(p.reserves[1]),
+        totalTrustlines: parseInt(p.total_trustlines || "0", 10),
+      }));
+
+    const nextCursor = records.length > 0 ? records[records.length - 1].paging_token || null : null;
+
+    return success(res, { pools, total: pools.length, limit, cursor: nextCursor });
   } catch (err) {
     next(err);
   }
@@ -593,14 +656,115 @@ router.get("/:code/:issuer/verify", async (req, res, next) => {
 
 
 /**
- * GET /asset/:code/:issuer/price
- * Returns the current DEX price for an asset quoted in XLM.
+ * GET /asset/:code/:issuer/toml
+ * Fetches the issuer's stellar.toml file, parses it, and returns the
+ * relevant asset metadata in clean JSON format.
+ *
+ * Returns { code, issuer, name, description, image, anchorAssetType, conditions }
+ * Missing optional fields are returned as null.
+ * Response is cached with a 5 minute TTL.
  *
  * @param {string} code   - Asset code (e.g. USDC)
  * @param {string} issuer - Issuer account public key (G...)
  *
  * @example
+ * GET /asset/USDC/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/toml
+ */
+router.get("/:code/:issuer/toml", async (req, res, next) => {
+  try {
+    const { code, issuer } = req.params;
+    validateAsset(code, issuer);
+
+    const assetCode = code.toUpperCase();
+    const cacheKey = `asset-toml:${assetCode}:${issuer}`;
+    const fresh = isFreshRequest(req.query);
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    let issuerAccount;
+    try {
+      issuerAccount = await server.loadAccount(issuer);
+    } catch (err) {
+      throw makeAccountNotFoundError(issuer, NETWORK);
+    }
+
+    const homeDomain = issuerAccount.home_domain;
+    if (!homeDomain) {
+      throw makeTomlFetchFailedError(issuer);
+    }
+
+    let toml;
+    try {
+      ({ toml } = await fetchNormalisedToml(homeDomain));
+    } catch (err) {
+      throw makeTomlFetchFailedError(issuer);
+    }
+
+    if (!toml) {
+      throw makeTomlFetchFailedError(issuer);
+    }
+
+    // Find the currency entry for this specific asset
+    const currencies = toml.currencies || [];
+    const assetEntry = currencies.find(
+      (curr) => curr.code === assetCode && curr.issuer === issuer
+    );
+
+    // Build the response with asset-specific metadata
+    const data = {
+      code: assetCode,
+      issuer: issuer,
+      name: assetEntry?.name || null,
+      description: assetEntry?.desc || assetEntry?.description || null,
+      image: assetEntry?.image || null,
+      anchorAssetType: assetEntry?.asset?.type || null,
+      conditions: assetEntry?.conditions || null,
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.toml);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /asset/:code/:issuer/price
+ * Returns the current DEX price for an asset quoted in XLM, derived from the
+ * live Horizon order book for the ASSET/XLM pair.
+ *
+ * `bid` is the best price a buyer is currently offering, `ask` is the best
+ * price a seller is asking, and `mid` is their midpoint. When only one side of
+ * the book has offers, `mid` falls back to that side's price. All three are
+ * seven-decimal strings so they can be fed straight back into Stellar
+ * operations without precision loss.
+ *
+ * Responses are cached for 5 seconds by default (CACHE_TTL_ASSET_PRICE_MS).
+ *
+ * @param {string} code   - Asset code (e.g. USDC)
+ * @param {string} issuer - Issuer account public key (G...)
+ * @param {string} [fresh] - Query param; "true" bypasses the cache.
+ *
+ * @example
  * GET /asset/USDC/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/price
+ * // {
+ * //   "success": true,
+ * //   "data": {
+ * //     "asset": { "code": "USDC", "issuer": "GA5Z...", "type": "credit_alphanum4" },
+ * //     "quoteAsset": "XLM",
+ * //     "bid": "0.1284000",
+ * //     "ask": "0.1291000",
+ * //     "mid": "0.1287500",
+ * //     "priceInXlm": "0.1287500"
+ * //   }
+ * // }
  */
 router.get("/:code/:issuer/price", async (req, res, next) => {
   try {
@@ -620,31 +784,210 @@ router.get("/:code/:issuer/price", async (req, res, next) => {
     }
 
     const asset = new Asset(assetCode, issuer);
-    const amount = "1.0000000";
 
-    const pathsResponse = await server
-      .strictSendPaths(asset, amount, [Asset.native()])
+    const orderBookResponse = await server
+      .orderbook(asset, Asset.native())
+      .limit(200)
       .call();
 
-    const records = pathsResponse.records || [];
+    const bids = orderBookResponse.bids || [];
+    const asks = orderBookResponse.asks || [];
 
-    if (records.length === 0) {
-      throw makeAssetNotFoundError(assetCode, issuer, NETWORK);
+    if (bids.length === 0 && asks.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: makeOrderBookEmptyError(assetCode, "XLM"),
+      });
     }
 
-    const best = records.reduce((a, b) =>
-      parseFloat(a.destination_amount) >= parseFloat(b.destination_amount) ? a : b
-    );
+    const bid = bids.length > 0 ? parseFloat(bids[0].price) : null;
+    const ask = asks.length > 0 ? parseFloat(asks[0].price) : null;
+
+    // With both sides quoted the mid is their midpoint; with only one side
+    // quoted that side is the only price the market is offering.
+    const mid = bid !== null && ask !== null ? (bid + ask) / 2 : (bid !== null ? bid : ask);
 
     const data = {
       asset: normalizeAsset(assetCode, issuer, "credit_alphanum4"),
-      priceInXlm: best.destination_amount,
-      sourceAmount: best.source_amount,
       quoteAsset: "XLM",
+      bid: bid !== null ? bid.toFixed(7) : null,
+      ask: ask !== null ? ask.toFixed(7) : null,
+      mid: mid.toFixed(7),
+      // Retained for backwards compatibility with callers written against the
+      // previous path-payment response; always mirrors `mid`.
+      priceInXlm: mid.toFixed(7),
     };
 
     cacheService.set(cacheKey, data, cacheTTL.assetPrice);
 
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    if (err.response && err.response.status === 404) {
+      return res.status(404).json({
+        success: false,
+        error: makeOrderBookEmptyError(String(req.params.code).toUpperCase(), "XLM"),
+      });
+    }
+    next(err);
+  }
+});
+
+/**
+ * Resolution map for the holder-growth time series.
+ *
+ * Each resolution defines a look-back window (`windowMs`) and a bucket size
+ * (`bucketMs`). Trustline operations are grouped into buckets of `bucketMs`
+ * and ordered oldest-first; `holders` is the cumulative net change since the
+ * start of the window.
+ *
+ * - 7d  — 7-day window,   daily buckets   (fine-grained recent growth)
+ * - 30d — 30-day window, weekly buckets  (month-over-month growth, default)
+ * - 90d — 90-day window, weekly buckets  (quarterly growth trend)
+ */
+const HOLDER_GROWTH_RESOLUTIONS = {
+  "7d": { windowMs: 7 * 24 * 60 * 60 * 1000, bucketMs: 24 * 60 * 60 * 1000 },
+  "30d": { windowMs: 30 * 24 * 60 * 60 * 1000, bucketMs: 7 * 24 * 60 * 60 * 1000 },
+  "90d": { windowMs: 90 * 24 * 60 * 60 * 1000, bucketMs: 7 * 24 * 60 * 60 * 1000 },
+};
+
+/**
+ * Buckets change_trust operations into a holder-growth time series.
+ *
+ * A change_trust operation with `limit > 0` creates a trustline (+1 holder);
+ * a change_trust with `limit === 0` removes one (-1 holder). Operations that
+ * fall before `windowStartMs` are excluded. Buckets are returned oldest-first
+ * with a running `holders` total so each entry describes the net growth at
+ * that point in time.
+ *
+ * @param {Array<Object>} operations - change_trust records from Horizon.
+ * @param {number} windowStartMs - Unix-ms cutoff; earlier ops are ignored.
+ * @param {number} bucketMs - Width of each time bucket in milliseconds.
+ * @returns {Array<{date: string, holders: number, change: number, added: number, removed: number}>}
+ */
+function aggregateTrustlineGrowth(operations, windowStartMs, bucketMs) {
+  const buckets = new Map();
+
+  for (const op of operations) {
+    const opTime = new Date(op.created_at).getTime();
+    if (!Number.isFinite(opTime) || opTime < windowStartMs) {
+      continue;
+    }
+
+    const bucketStart = Math.floor(opTime / bucketMs) * bucketMs;
+    if (!buckets.has(bucketStart)) {
+      buckets.set(bucketStart, {
+        bucketStart,
+        date: new Date(bucketStart).toISOString(),
+        change: 0,
+        added: 0,
+        removed: 0,
+      });
+    }
+
+    const bucket = buckets.get(bucketStart);
+    if (parseFloat(op.limit) > 0) {
+      bucket.change += 1;
+      bucket.added += 1;
+    } else {
+      bucket.change -= 1;
+      bucket.removed += 1;
+    }
+  }
+
+  const sorted = Array.from(buckets.values()).sort(
+    (a, b) => a.bucketStart - b.bucketStart,
+  );
+
+  let cumulativeHolders = 0;
+  return sorted.map((bucket) => {
+    cumulativeHolders += bucket.change;
+    return {
+      date: bucket.date,
+      holders: cumulativeHolders,
+      change: bucket.change,
+      added: bucket.added,
+      removed: bucket.removed,
+    };
+  });
+}
+
+/**
+ * GET /asset/:code/:issuer/holder-growth
+ *
+ * Returns a holder-growth time series built from trustline (change_trust)
+ * operation history. Each entry covers one time bucket (sized by the
+ * resolution) and reports the net change in holders within that bucket plus
+ * the cumulative holder count since the start of the window.
+ *
+ * @param {string} code - Asset code, e.g. USDC
+ * @param {string} issuer - Asset issuer account ID (G...)
+ * @param {string} [resolution=30d] - Time resolution: 7d, 30d, or 90d.
+ * @param {string} [fresh] - Bypass cache when "true".
+ * @returns {Object} `{ growth: Array, asset: Object, resolution: string }`
+ * @example
+ * curl "http://localhost:3000/asset/USDC/GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/holder-growth?resolution=30d"
+ */
+router.get("/:code/:issuer/holder-growth", async (req, res, next) => {
+  try {
+    const { code, issuer } = req.params;
+    validateAsset(code, issuer);
+
+    const assetCode = code.toUpperCase();
+    const resolution = req.query.resolution || "30d";
+
+    if (!HOLDER_GROWTH_RESOLUTIONS[resolution]) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          type: "ValidationError",
+          message: "Invalid resolution. Accepted values are 7d, 30d, and 90d.",
+          field: "resolution",
+          receivedValue: String(resolution),
+        },
+      });
+    }
+
+    const cacheKey = `asset-holder-growth:${assetCode}:${issuer}:${resolution}`;
+    const fresh = isFreshRequest(req.query);
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    const { windowMs, bucketMs } = HOLDER_GROWTH_RESOLUTIONS[resolution];
+    const windowStartMs = Date.now() - windowMs;
+
+    // Fetch recent operations for the issuer and keep only change_trust ops
+    // that target this asset. `limit > 0` is a trustline creation, `limit === 0`
+    // is a trustline deletion (see the change_trust mapping in account.js).
+    const operationsResponse = await server
+      .operations()
+      .forAccount(issuer)
+      .order("desc")
+      .limit(200)
+      .call();
+
+    const records = (operationsResponse.records || []).filter(
+      (op) =>
+        op.type === "change_trust" &&
+        op.asset_code === assetCode &&
+        op.asset_issuer === issuer,
+    );
+
+    const growth = aggregateTrustlineGrowth(records, windowStartMs, bucketMs);
+
+    const data = {
+      growth,
+      asset: normalizeAsset(assetCode, issuer, "credit_alphanum4"),
+      resolution,
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.asset);
     res.set("X-Cache", "MISS");
     return success(res, data);
   } catch (err) {
@@ -653,3 +996,4 @@ router.get("/:code/:issuer/price", async (req, res, next) => {
 });
 
 module.exports = router;
+
