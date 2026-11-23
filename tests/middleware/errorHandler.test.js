@@ -532,7 +532,7 @@ describe("errorHandler middleware — full coverage", () => {
         error: {
           type: "InvalidCursor",
           message: "Bad cursor",
-          suggestion: "Use the cursor value returned in the previous response's data.cursor field.",
+          suggestion: "Use the cursor returned in the previous response.",
         },
         requestId: "req-572-test",
       });

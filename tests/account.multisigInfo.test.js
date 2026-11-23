@@ -2,7 +2,7 @@
  * Tests for GET /account/:id/multisig-info
  *
  * Covers:
- *   - Returns isMultisig, thresholds (low/med/high), masterWeight, signers list
+ *   - Returns isMultisig, thresholds (low/medium/high), masterWeight, signers list
  *   - isMultisig=true  when multiple signers exist
  *   - isMultisig=false when account has only the master key with default thresholds
  *   - isMultisig=true  when thresholds exceed the master key weight
@@ -78,10 +78,10 @@ describe("GET /account/:id/multisig-info — multisig account", () => {
     expect(res.body.data.accountId).toBe(accountId);
   });
 
-  it("thresholds object contains low, med, high", async () => {
+  it("thresholds object contains low, medium, high", async () => {
     const res = await request(app).get(`/account/${accountId}/multisig-info`);
     const { thresholds } = res.body.data;
-    expect(thresholds).toEqual({ low: 1, med: 3, high: 5 });
+    expect(thresholds).toEqual({ low: 1, medium: 3, high: 5 });
   });
 
   it("masterWeight equals the weight of the account's own key", async () => {
