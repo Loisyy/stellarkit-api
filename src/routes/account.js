@@ -1,4 +1,6 @@
 const express = require("express");
+const { validateBody } = require("../middleware/validateBody");
+const schemas = require("../middleware/bodySchemas");
 const router = express.Router();
 const { server, NETWORK, fetchAccountCreation } = require("../config/stellar");
 const { success, toISOTimestamp } = require("../utils/response");
@@ -7,7 +9,9 @@ const {
   makeTrustlineNotFoundError,
 } = require("../utils/errors");
 const cacheService = require("../services/cache");
+const watchlistService = require("../services/watchlistService");
 const cacheTTL = require("../config/cacheConfig");
+const { singleFlight } = require("../utils/singleFlight");
 const {
   validateAccountId,
   validateAssetCode,
@@ -44,6 +48,7 @@ async function withHorizonTiming(req, fn) {
 
 const { buildAccountAgeResponse } = require("../utils/accountAge");
 const { parsePaginationParams } = require("../utils/pagination");
+const { cacheKey: buildCacheKey, isFresh } = require("../utils/cacheKey");
 const { formatLedgerSequence } = require("../utils/formatLedgerSequence");
 
 
@@ -51,11 +56,17 @@ const axios = require("axios");
 const { Asset, scValToNative, xdr } = require("@stellar/stellar-sdk");
 const { normalizeAsset, normalizeAssetFromString } = require("../utils/asset");
 const { isNativeAsset, isNonNativeAsset } = require("../utils/assetHelpers");
-const { getAssetMetadataFromToml, fetchStellarToml } = require("../utils/tomlResolver");
+const {
+  getAssetMetadataFromToml,
+  fetchStellarToml,
+  fetchStellarTomlResult,
+  normaliseStellarToml,
+} = require("../utils/tomlResolver");
 const { formatBalance } = require("../utils/formatBalance");
 const { parseStellarAmount } = require("../utils/parseStellarAmount");
 const { formatAmount } = require("../utils/formatAmount");
 const { mapAccountTrade } = require("../utils/mapAccountTrade");
+const { toCsv, parseExportFormat, csvAmount } = require("../utils/csv");
 
 // Cache TTL for account endpoint responses (in seconds)
 const CACHE_TTL_ACCOUNT = parseInt(process.env.CACHE_TTL_ACCOUNT_MS, 10) / 1000 || 10;
@@ -361,6 +372,78 @@ router.get("/:id/trustlines", async (req, res, next) => {
       limit: null,
       cursor: null,
     });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/trustline-limits
+ *
+ * Returns trustline limit information for an account, including capacity
+ * utilization and whether each trustline is near its limit.
+ *
+ * Query params:
+ *   - fresh (boolean, default: false) — bypasses the cache when set to "true"
+ *
+ * Response headers:
+ *   - X-Cache: HIT  — served from cache
+ *   - X-Cache: MISS — fetched live from Horizon and cached
+ *
+ * Returns:
+ *   { success: true, data: { accountId, trustlines: [{ asset, balance, limit, usedPercent, nearLimit }] } }
+ *   - usedPercent: percentage of the limit that is currently used (0-100)
+ *   - nearLimit: true if usedPercent >= 95
+ */
+router.get("/:id/trustline-limits", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+    const cacheKey = `trustline-limits:${id}`;
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const trustlineBalances = (account.balances || []).filter(
+      (b) => isNonNativeAsset(b),
+    );
+
+    const trustlines = trustlineBalances.map((b) => {
+      const balance = parseFloat(b.balance);
+      const limit = parseFloat(b.limit);
+      const usedPercent = limit > 0 ? (balance / limit) * 100 : 0;
+      const nearLimit = usedPercent >= 95;
+
+      return {
+        asset: {
+          code: b.asset_code,
+          issuer: b.asset_issuer,
+          type: b.asset_type,
+        },
+        balance: b.balance,
+        limit: b.limit,
+        usedPercent,
+        nearLimit,
+      };
+    });
+
+    const data = {
+      accountId: id,
+      trustlines,
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.trustlines);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
@@ -1025,6 +1108,7 @@ router.get("/:id/payments", async (req, res, next) => {
       return next();
     }
     validateAccountId(id);
+    const format = parseExportFormat(req.query.format);
 
     const { limit, order, cursor } = parsePaginationParams(req.query);
 
@@ -1053,6 +1137,19 @@ router.get("/:id/payments", async (req, res, next) => {
       err.expectedFormat = "ISO 8601 date earlier than endDate";
       err.status = 400;
       throw err;
+    }
+
+    const cacheKey = buildCacheKey(req, {
+      namespace: `account-payments:${id}`,
+      allowedParams: ["limit", "order", "cursor", "assetCode", "assetIssuer", "startDate", "endDate"],
+      defaults: { limit: 20, order: "desc" },
+    });
+    if (!isFresh(req)) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached.data, { meta: cached.meta });
+      }
     }
 
     let query = server.payments().forAccount(id).limit(limit).order(order);
@@ -1156,9 +1253,8 @@ router.get("/:id/payments", async (req, res, next) => {
     const lastRecord = rawRecords[rawRecords.length - 1];
     const nextCursor = lastRecord ? lastRecord.paging_token : null;
 
-    return success(res, {
-      payments,
-    }, {
+    const payload = {
+      data: { payments },
       meta: {
         count: payments.length,
         limit,
@@ -1166,8 +1262,102 @@ router.get("/:id/payments", async (req, res, next) => {
         nextCursor: payments.length ? nextCursor : null,
         hasMore: nextCursor !== null,
       },
-    });
+    };
+    cacheService.set(cacheKey, payload, cacheTTL.payments);
+
+    res.set("X-Cache", "MISS");
+    return success(res, payload.data, { meta: payload.meta });
   } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/funded-accounts
+ * Returns accounts created by this account, scanning up to 10 Horizon pages.
+ */
+router.get("/:id/funded-accounts", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+    const { limit, order, cursor } = parsePaginationParams(req.query);
+
+    // Account operations cannot be filtered by type, so scan bounded pages.
+    await server.loadAccount(id);
+
+    const HORIZON_PAGE_SIZE = 200;
+    const MAX_PAGES = 10;
+    const fundedAccounts = [];
+    let totalStartingBalance = 0;
+    let nextCursor = cursor || null;
+    let partial = false;
+
+    for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber++) {
+      let query = server
+        .operations()
+        .forAccount(id)
+        .limit(HORIZON_PAGE_SIZE)
+        .order(order);
+      if (nextCursor) query = query.cursor(nextCursor);
+
+      const response = await query.call();
+      const records = response.records || [];
+      let reachedLimit = false;
+
+      for (const operation of records) {
+        if (operation.type === "create_account" && operation.funder === id) {
+          const startingBalance = Number(operation.starting_balance || 0);
+          fundedAccounts.push({
+            address: operation.account,
+            startingBalanceXLM: startingBalance.toFixed(7),
+            createdAt: toISOTimestamp(operation.created_at),
+            transactionHash: operation.transaction_hash,
+          });
+          totalStartingBalance += startingBalance;
+          if (fundedAccounts.length === limit) {
+            nextCursor = operation.paging_token || nextCursor;
+            reachedLimit = true;
+            break;
+          }
+        }
+
+        nextCursor = operation.paging_token || nextCursor;
+      }
+
+      if (reachedLimit) break;
+      if (records.length < HORIZON_PAGE_SIZE) {
+        nextCursor = records.length
+          ? records[records.length - 1].paging_token || nextCursor
+          : null;
+        break;
+      }
+      if (pageNumber === MAX_PAGES - 1) partial = true;
+    }
+
+    return success(
+      res,
+      {
+        items: fundedAccounts,
+        total: fundedAccounts.length,
+        totalStartingBalanceXLM: totalStartingBalance.toFixed(7),
+        limit,
+        cursor: nextCursor,
+      },
+      { meta: { partial } },
+    );
+  } catch (err) {
+    if (err && err.response && err.response.status === 404) {
+      const notFound = makeAccountNotFoundError(req.params.id, NETWORK);
+      return res.status(404).json({
+        success: false,
+        error: {
+          type: "AccountNotFound",
+          message: notFound.message,
+          suggestion:
+            "Verify the account address is correct and that the account has been funded.",
+        },
+      });
+    }
     handleAccountNotFound(err, next, req.params.id);
   }
 });
@@ -1196,6 +1386,7 @@ router.get("/:id/trades", async (req, res, next) => {
   try {
     const { id } = req.params;
     validateAccountId(id);
+    const format = parseExportFormat(req.query.format);
 
     const { limit, order, cursor } = parsePaginationParams(req.query);
     const fresh = req.query.fresh === true;
@@ -1268,9 +1459,101 @@ router.get("/:id/trades", async (req, res, next) => {
       },
     };
 
+    if (format === "csv") {
+      const headers = [
+        "tradeId", "ledgerCloseTime", "sellingAssetCode", "sellingAssetIssuer",
+        "sellingAssetType", "buyingAssetCode", "buyingAssetIssuer",
+        "buyingAssetType", "soldAmount", "boughtAmount", "price", "tradeType",
+        "offerId", "transactionHash",
+      ];
+      const rows = trades.map((t) => [
+        t.tradeId, t.ledgerCloseTime,
+        t.selling?.code ?? "", t.selling?.issuer ?? "", t.selling?.type ?? "",
+        t.buying?.code ?? "", t.buying?.issuer ?? "", t.buying?.type ?? "",
+        csvAmount(t.soldAmount), csvAmount(t.boughtAmount), csvAmount(t.price),
+        t.tradeType, t.offerId, t.transactionHash ?? "",
+      ]);
+      res.set("Content-Type", "text/csv; charset=utf-8");
+      res.set("Content-Disposition", 'attachment; filename="trades-.csv"');
+      if (trades.length && nextCursor) res.set("X-Next-Cursor", nextCursor);
+      return res.send(toCsv(headers, rows));
+    }
+
     cacheService.set(cacheKey, { ...data, ...metadata }, cacheTTL.trades);
     res.set("X-Cache", "MISS");
     return success(res, data, metadata);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/cross-asset-trades
+ * Returns path payments with at least one intermediate asset, including the
+ * full source-to-destination conversion path and effective exchange rate.
+ */
+router.get("/:id/cross-asset-trades", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+    const { limit, order, cursor } = parsePaginationParams(req.query, 200);
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    let query = server.payments().forAccount(id).limit(limit).order(order);
+    if (cursor) query = query.cursor(cursor);
+
+    const response = await withHorizonTiming(req, () => query.call());
+    const records = response.records || [];
+    const pathPaymentTypes = new Set([
+      "path_payment_strict_send",
+      "path_payment_strict_receive",
+    ]);
+    const trades = records
+      .filter((operation) => pathPaymentTypes.has(operation.type) && (operation.path || []).length > 0)
+      .map((operation) => {
+        const sourceType = operation.source_asset_type || "native";
+        const exitType = operation.asset_type || "native";
+        const entryAsset = normalizeAsset(
+          sourceType === "native" ? "XLM" : operation.source_asset_code,
+          sourceType === "native" ? null : operation.source_asset_issuer,
+          sourceType,
+        );
+        const exitAsset = normalizeAsset(
+          exitType === "native" ? "XLM" : operation.asset_code,
+          exitType === "native" ? null : operation.asset_issuer,
+          exitType,
+        );
+        const entryValue = Number(operation.source_amount ?? operation.source_max ?? 0);
+        const exitValue = Number(operation.amount || 0);
+        const intermediateAssets = operation.path.map((asset) => {
+          const type = asset.asset_type || "native";
+          return normalizeAsset(
+            type === "native" ? "XLM" : asset.asset_code,
+            type === "native" ? null : asset.asset_issuer,
+            type,
+          );
+        });
+
+        return {
+          tradeId: operation.id,
+          path: [entryAsset, ...intermediateAssets, exitAsset],
+          entryAsset,
+          exitAsset,
+          entryAmount: entryValue.toFixed(7),
+          exitAmount: exitValue.toFixed(7),
+          effectiveRate: (entryValue > 0 ? exitValue / entryValue : 0).toFixed(7),
+          timestamp: toISOTimestamp(operation.created_at),
+        };
+      });
+
+    const lastRecord = records[records.length - 1];
+    return success(res, {
+      trades,
+      total: trades.length,
+      limit,
+      cursor: lastRecord ? lastRecord.paging_token || null : null,
+    });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
@@ -1408,6 +1691,99 @@ router.get("/:id/offers", async (req, res, next) => {
   }
 });
 
+
+const SIGNER_CHANGE_EFFECT_TYPES = new Set([
+  "signer_created",
+  "signer_removed",
+  "signer_updated",
+  "account_thresholds_updated",
+]);
+
+/**
+ * GET /account/:id/signer-changes
+ *
+ * Lists recent signer and threshold effects for takeover monitoring. A newly
+ * created signer whose weight meets the account's current high threshold is
+ * flagged with `controlCapable: true`.
+ */
+router.get("/:id/signer-changes", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const rawDays = req.query.days === undefined ? 30 : Number(req.query.days);
+    if (!Number.isFinite(rawDays) || rawDays < 1) {
+      const err = new Error("Query param 'days' must be a positive number.");
+      err.isValidation = true;
+      err.field = "days";
+      err.status = 400;
+      throw err;
+    }
+    const days = Math.min(Math.floor(rawDays), 365);
+    const { limit, order, cursor } = parsePaginationParams(req.query);
+    const cutoff = Date.now() - days * MS_PER_DAY;
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+    const currentThresholds = {
+      low: Number(account.thresholds?.low_threshold ?? 0),
+      med: Number(account.thresholds?.med_threshold ?? 0),
+      high: Number(account.thresholds?.high_threshold ?? 0),
+    };
+
+    let query = server.effects().forAccount(id).limit(limit).order(order);
+    if (cursor) query = query.cursor(cursor);
+    const effectResponse = await query.call();
+    const effects = (effectResponse.records || []).filter((effect) => {
+      const type = effect.type === "account_thresholds_updated" ? "thresholds_updated" : effect.type;
+      if (!SIGNER_CHANGE_EFFECT_TYPES.has(effect.type)) return false;
+      const timestamp = Date.parse(effect.created_at);
+      return Number.isNaN(timestamp) || timestamp >= cutoff;
+    });
+
+    const changes = effects.map((effect) => {
+      const type = effect.type === "account_thresholds_updated" ? "thresholds_updated" : effect.type;
+      const weight = effect.weight != null ? Number(effect.weight) : null;
+      const thresholds =
+        type === "thresholds_updated"
+          ? {
+              low: Number(effect.low_threshold ?? currentThresholds.low),
+              med: Number(effect.med_threshold ?? currentThresholds.med),
+              high: Number(effect.high_threshold ?? currentThresholds.high),
+            }
+          : currentThresholds;
+
+      return {
+        type,
+        signerKey: effect.public_key || effect.key || effect.signer?.key || null,
+        weight,
+        thresholds,
+        controlCapable:
+          type === "signer_created" &&
+          weight !== null &&
+          currentThresholds.high > 0 &&
+          weight >= currentThresholds.high,
+        ledger: effect.ledger_sequence ?? effect.ledger ?? null,
+        timestamp: toISOTimestamp(effect.created_at),
+        transactionHash: effect.transaction_hash || null,
+      };
+    });
+
+    return success(res, {
+      accountId: id,
+      changes,
+      total: changes.length,
+    }, {
+      meta: {
+        limit,
+        order,
+        days,
+        cursor: cursor || null,
+      },
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
 
 /**
  * GET /account/:id/history
@@ -1942,6 +2318,186 @@ router.get("/:id/effects", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/claimable-balance-summary
+ *
+ * Returns a compact summary of an account's claimable balances without
+ * fetching the full paginated list. Categorises balances by eligibility:
+ *   - eligibleNow  — predicates are satisfied at the current time
+ *   - pending      — predicates exist but are not yet satisfied (time-locked)
+ *   - expired      — past their not_after predicate; can no longer be claimed
+ *
+ * totalValueXLM is computed from eligible balances only, treating every
+ * native XLM balance at face value. Non-XLM balances contribute 0 to the
+ * total (no cross-asset pricing is performed).
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId:     string,
+ *       totalBalances: number,   // integer count of all claimable balances
+ *       eligibleNow:   number,   // integer
+ *       pending:       number,   // integer
+ *       expired:       number,   // integer
+ *       totalValueXLM: string    // seven-decimal string, eligible XLM only
+ *     }
+ *   }
+ *
+ * Returns 404 when the account does not exist.
+ * Response is cached with a 15 second TTL. Pass ?fresh=true to bypass.
+ *
+ * @example
+ *   GET /account/GABC.../claimable-balance-summary
+ */
+router.get("/:id/claimable-balance-summary", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const fresh = req.query.fresh === "true";
+    const cacheKey = `claimable-balance-summary:${id}`;
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    // Ensure the account exists — raises 404 for unknown accounts.
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    // Fetch all claimable balances for this claimant (up to 200 per page).
+    // For summary purposes a single page is sufficient; most accounts hold
+    // far fewer than 200 pending claimable balances.
+    const response = await server
+      .claimableBalances()
+      .claimant(id)
+      .limit(200)
+      .order("desc")
+      .call();
+
+    const records = response.records || [];
+    const now = Date.now();
+
+    let eligibleNow = 0;
+    let pending = 0;
+    let expired = 0;
+    let totalValueXLMRaw = 0;
+
+    for (const balance of records) {
+      // Find the predicate for this specific claimant.
+      const claimantEntry = (balance.claimants || []).find(
+        (c) => c.destination === id
+      );
+
+      const predicate = claimantEntry ? claimantEntry.predicate : null;
+      const eligibility = evaluateClaimPredicate(predicate, now);
+
+      if (eligibility === "eligible") {
+        eligibleNow++;
+        // Accumulate XLM value from eligible native balances only.
+        if (balance.asset === "native" || balance.asset_type === "native") {
+          totalValueXLMRaw += parseFloat(balance.amount || "0");
+        }
+      } else if (eligibility === "expired") {
+        expired++;
+      } else {
+        pending++;
+      }
+    }
+
+    const data = {
+      accountId: id,
+      totalBalances: records.length,
+      eligibleNow,
+      pending,
+      expired,
+      totalValueXLM: totalValueXLMRaw.toFixed(7),
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.claimableBalanceSummary);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * Evaluates a Horizon claimable balance predicate against the current time.
+ *
+ * Horizon predicates can be:
+ *   - null / { unconditional: true }   → always eligible
+ *   - { not: { unconditional: true } } → never eligible (treat as expired)
+ *   - { abs_before: "<ISO>" }          → eligible before that time (expired if past)
+ *   - { rel_before: "<seconds>" }      → treated as pending (relative to creation,
+ *                                        which we don't have here without extra fetch)
+ *   - { and: [...] } / { or: [...] }   → compound predicates
+ *
+ * Returns "eligible", "pending", or "expired".
+ *
+ * @param {object|null} predicate - Raw Horizon predicate object
+ * @param {number} nowMs - Current time in milliseconds
+ * @returns {"eligible"|"pending"|"expired"}
+ */
+function evaluateClaimPredicate(predicate, nowMs) {
+  // Null or missing predicate — unconditionally claimable
+  if (!predicate || predicate.unconditional === true) {
+    return "eligible";
+  }
+
+  // { not: { unconditional: true } } — permanently unclaimable
+  if (
+    predicate.not &&
+    predicate.not.unconditional === true
+  ) {
+    return "expired";
+  }
+
+  // Absolute time-lock: claimable only before this timestamp
+  if (predicate.abs_before) {
+    const deadline = new Date(predicate.abs_before).getTime();
+    if (Number.isFinite(deadline)) {
+      return nowMs < deadline ? "eligible" : "expired";
+    }
+  }
+
+  // Absolute time-lock as epoch seconds (abs_before_epoch)
+  if (predicate.abs_before_epoch != null) {
+    const deadline = Number(predicate.abs_before_epoch) * 1000;
+    if (Number.isFinite(deadline)) {
+      return nowMs < deadline ? "eligible" : "expired";
+    }
+  }
+
+  // Relative time-lock — requires creation time to evaluate; treat as pending
+  if (predicate.rel_before != null) {
+    return "pending";
+  }
+
+  // Compound AND — all sub-predicates must be eligible
+  if (Array.isArray(predicate.and)) {
+    const results = predicate.and.map((p) => evaluateClaimPredicate(p, nowMs));
+    if (results.every((r) => r === "eligible")) return "eligible";
+    if (results.some((r) => r === "expired")) return "expired";
+    return "pending";
+  }
+
+  // Compound OR — at least one sub-predicate must be eligible
+  if (Array.isArray(predicate.or)) {
+    const results = predicate.or.map((p) => evaluateClaimPredicate(p, nowMs));
+    if (results.some((r) => r === "eligible")) return "eligible";
+    if (results.every((r) => r === "expired")) return "expired";
+    return "pending";
+  }
+
+  // Unknown predicate shape — treat as pending (conservative)
+  return "pending";
+}
+
+/**
  * GET /account/:id/claimable-balances
  * Returns claimable balances for an account, categorized by claimability.
  *
@@ -2381,6 +2937,138 @@ router.get("/:id/asset-exposure", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/asset-diversity
+ *
+ * Computes the Herfindahl-Hirschman Index (HHI) for the account's portfolio
+ * based on DEX order-book prices converted to XLM.
+ *
+ * HHI = Σ (portfolioPercent_i)²  where percent is on a 0–100 scale.
+ *   - HHI = 10000  → 100% in one asset (fully concentrated)
+ *   - HHI ≤ 1500   → well diversified
+ *   - 1500 < HHI ≤ 2500 → moderately diversified
+ *   - HHI > 2500   → concentrated
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId:      string,
+ *       hhi:            number,   // integer 0–10000
+ *       diversityLevel: "diversified" | "moderate" | "concentrated",
+ *       breakdown: [
+ *         {
+ *           asset:            { code, issuer, type },
+ *           balance:          string,
+ *           valueInXLM:       string | null,
+ *           portfolioPercent: number | null   // 0–100 (two decimal places)
+ *         }
+ *       ]
+ *     }
+ *   }
+ *
+ * Returns 404 when the account does not exist.
+ *
+ * @example
+ *   GET /account/GABC.../asset-diversity
+ */
+router.get("/:id/asset-diversity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    // Gather all balances (native XLM + non-native assets)
+    const allBalances = (account.balances || []).filter(
+      (b) => isNativeAsset(b) || isNonNativeAsset(b)
+    );
+
+    // Price each asset in XLM via the DEX order book
+    const priced = await Promise.all(
+      allBalances.map(async (b) => {
+        const native = isNativeAsset(b);
+        const assetCode = native ? "XLM" : b.asset_code;
+        const assetIssuer = native ? null : b.asset_issuer;
+        const assetType = b.asset_type;
+        const balance = parseFloat(b.balance || "0");
+
+        let priceInXLM = native ? 1 : null;
+
+        if (!native) {
+          try {
+            const asset = new Asset(assetCode, assetIssuer);
+            const ob = await server
+              .orderbook(asset, Asset.native())
+              .limit(1)
+              .call();
+            const bids = ob.bids || [];
+            const asks = ob.asks || [];
+            const bid = bids.length ? parseFloat(bids[0].price) : null;
+            const ask = asks.length ? parseFloat(asks[0].price) : null;
+            if (bid !== null && ask !== null) priceInXLM = (bid + ask) / 2;
+            else if (bid !== null) priceInXLM = bid;
+            else if (ask !== null) priceInXLM = ask;
+          } catch (_) {
+            // No order book available — asset remains unpriced
+          }
+        }
+
+        const valueInXLM = priceInXLM !== null ? balance * priceInXLM : null;
+
+        return {
+          asset: normalizeAsset(assetCode, assetIssuer, assetType),
+          balance: toSevenDecimalString(balance),
+          valueInXLM,
+          _raw: valueInXLM,
+        };
+      })
+    );
+
+    // Compute total portfolio value in XLM (priced assets only)
+    const totalValueXLM = priced.reduce(
+      (sum, entry) => sum + (entry._raw !== null ? entry._raw : 0),
+      0
+    );
+
+    // Assign portfolio percentages and compute HHI
+    let hhi = 0;
+    const breakdown = priced.map((entry) => {
+      let portfolioPercent = null;
+      if (entry._raw !== null && totalValueXLM > 0) {
+        portfolioPercent = Number(
+          ((entry._raw / totalValueXLM) * 100).toFixed(2)
+        );
+        hhi += portfolioPercent * portfolioPercent;
+      }
+      return {
+        asset: entry.asset,
+        balance: entry.balance,
+        valueInXLM:
+          entry._raw !== null ? toSevenDecimalString(entry._raw) : null,
+        portfolioPercent,
+      };
+    });
+
+    // Round HHI to nearest integer (consistent with standard HHI reporting)
+    hhi = Math.round(hhi);
+
+    let diversityLevel;
+    if (hhi > 2500) diversityLevel = "concentrated";
+    else if (hhi > 1500) diversityLevel = "moderate";
+    else diversityLevel = "diversified";
+
+    return success(res, {
+      accountId: id,
+      hhi,
+      diversityLevel,
+      breakdown,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id — full account details
  *
  * Fetches live account data from Horizon via server.loadAccount(id) and maps
@@ -2405,10 +3093,13 @@ router.get("/:id", async (req, res, next) => {
     const { id } = req.params;
     validateAccountId(id);
 
-    const cacheKey = `account:${id}`;
-    const fresh = req.query.fresh === true || req.query.fresh === "true";
+    // No query params change this response, so unknown params are dropped
+    // from the key and every variant shares the "account:<id>" entry.
+    const cacheKey = buildCacheKey(req, { namespace: `account:${id}`, allowedParams: [] });
+    const fresh = isFresh(req);
 
-    // Serve from cache unless caller requests a fresh fetch
+    // Serve from cache unless caller requests a fresh fetch. A fresh request
+    // still repopulates the normal key below.
     if (!fresh) {
       const cached = cacheService.get(cacheKey);
       if (cached) {
@@ -2417,7 +3108,9 @@ router.get("/:id", async (req, res, next) => {
       }
     }
 
-    // Fetch live account data from Horizon
+    // Fetch live account data from Horizon. Concurrent misses (or ?fresh=true
+    // requests) for the same account share a single upstream call.
+    const data = await singleFlight(cacheKey, async () => {
     const account = await withHorizonTiming(req, () => server.loadAccount(id));
 
     // --- Balances -----------------------------------------------------------
@@ -2469,7 +3162,7 @@ router.get("/:id", async (req, res, next) => {
       clawbackEnabled: rawFlags.auth_clawback_enabled === true,
     };
 
-    const data = {
+    const accountData = {
       accountId: account.id,
       sequence: account.sequence,
       subentryCount: account.subentry_count,
@@ -2506,7 +3199,9 @@ router.get("/:id", async (req, res, next) => {
     };
 
     // Cache the normalised response
-    cacheService.set(cacheKey, data, CACHE_TTL_ACCOUNT);
+    cacheService.set(cacheKey, accountData, CACHE_TTL_ACCOUNT);
+    return accountData;
+    });
 
     res.set("X-Cache", "MISS");
     return success(res, data);
@@ -3257,6 +3952,241 @@ router.get("/:id/age", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/transaction-velocity
+ *
+ * Returns transaction counts per hour for the last 24 hours, the peak hour,
+ * and a velocityScore (0–100) indicating how unusual the current rate is
+ * relative to the account's historical average.
+ *
+ * Response shape:
+ *   {
+ *     accountId,
+ *     hourlyBreakdown: [{ hour, timestamp, count }],  // 24 entries, oldest first
+ *     peakHour,        // ISO timestamp of the busiest hour, or null when inactive
+ *     peakCount,
+ *     averagePerHour,
+ *     velocityScore    // 0–100, 0 for inactive accounts
+ *   }
+ *
+ * @example
+ * GET /account/GABC.../transaction-velocity
+ */
+router.get("/:id/transaction-velocity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const HOUR_MS = 60 * 60 * 1000;
+    const WINDOW_HOURS = 24;
+
+    // Align the window to the start of the current hour so buckets are stable.
+    const now = Date.now();
+    const currentHourStart = Math.floor(now / HOUR_MS) * HOUR_MS;
+    const windowStart = currentHourStart - (WINDOW_HOURS - 1) * HOUR_MS;
+
+    const hourlyBreakdown = [];
+    for (let i = 0; i < WINDOW_HOURS; i++) {
+      const bucketStart = windowStart + i * HOUR_MS;
+      hourlyBreakdown.push({
+        hour: new Date(bucketStart).toISOString(),
+        timestamp: new Date(bucketStart).toISOString(),
+        count: 0,
+      });
+    }
+
+    const txResponse = await server
+      .transactions()
+      .forAccount(id)
+      .order("desc")
+      .limit(200)
+      .call();
+    const records = txResponse.records || [];
+
+    let totalInWindow = 0;
+    let oldestSeen = null;
+    for (const tx of records) {
+      const createdAt = new Date(tx.created_at).getTime();
+      if (!Number.isFinite(createdAt)) continue;
+      if (oldestSeen === null || createdAt < oldestSeen) oldestSeen = createdAt;
+      if (createdAt < windowStart || createdAt > now) continue;
+      const bucketIndex = Math.floor((createdAt - windowStart) / HOUR_MS);
+      if (bucketIndex < 0 || bucketIndex >= WINDOW_HOURS) continue;
+      hourlyBreakdown[bucketIndex].count += 1;
+      totalInWindow += 1;
+    }
+
+    let peakHour = null;
+    let peakCount = 0;
+    for (const bucket of hourlyBreakdown) {
+      if (bucket.count > peakCount) {
+        peakCount = bucket.count;
+        peakHour = bucket.hour;
+      }
+    }
+
+    const averagePerHour = totalInWindow / WINDOW_HOURS;
+
+    // Historical average hourly rate: spread the fetched transactions over the
+    // span from the oldest fetched record to now. When the account has no
+    // activity at all, the velocity score is 0.
+    let velocityScore = 0;
+    if (totalInWindow > 0 && oldestSeen !== null) {
+      const spanHours = Math.max(1, (now - oldestSeen) / HOUR_MS);
+      const historicalAveragePerHour = records.length / spanHours;
+      const ratio =
+        historicalAveragePerHour > 0
+          ? averagePerHour / historicalAveragePerHour
+          : 0;
+      // A ratio of 1 (current rate matches history) maps to 50; higher ratios
+      // push the score toward 100, lower ratios toward 0.
+      velocityScore = Math.round(Math.max(0, Math.min(100, ratio * 50)));
+    }
+
+    return success(res, {
+      accountId: id,
+      hourlyBreakdown,
+      peakHour,
+      peakCount,
+      averagePerHour,
+      velocityScore,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/largest-transactions
+ *
+ * Returns the top N transactions by total operation value for an account,
+ * sorted by value descending.
+ *
+ * Query params:
+ *   - direction (string, default: "both") — "sent", "received", or "both"
+ *   - limit (number, default: 10, max: 50) — number of transactions to return
+ *
+ * Response:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId,
+ *       transactions: [
+ *         {
+ *           hash,
+ *           totalValueXLM,
+ *           operationCount,
+ *           direction,
+ *           timestamp
+ *         }
+ *       ],
+ *       period: { from, to }
+ *     }
+ *   }
+ *
+ * Returns 404 if the account does not exist.
+ */
+router.get("/:id/largest-transactions", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    // Validate account exists
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    // Validate direction parameter
+    let direction = (req.query.direction || "both").toLowerCase();
+    if (!["sent", "received", "both"].includes(direction)) {
+      const err = new Error(`Invalid direction "${req.query.direction}". Must be "sent", "received", or "both".`);
+      err.isValidation = true;
+      err.field = "direction";
+      err.receivedValue = req.query.direction;
+      err.expectedFormat = "sent|received|both";
+      return next(err);
+    }
+
+    // Validate limit parameter
+    const rawLimit = req.query.limit || "10";
+    const limitNum = parseInt(rawLimit, 10);
+    if (!Number.isInteger(limitNum) || limitNum < 1 || limitNum > 50) {
+      const err = new Error("Query parameter 'limit': must be an integer between 1 and 50.");
+      err.isValidation = true;
+      err.field = "limit";
+      err.receivedValue = String(rawLimit);
+      err.expectedFormat = "1–50";
+      return next(err);
+    }
+
+    // Fetch payments for the account
+    const paymentsResponse = await withHorizonTiming(req, () =>
+      server.payments().forAccount(id).limit(200).order("desc").call()
+    );
+    const payments = paymentsResponse.records || [];
+
+    // Group payments by transaction hash and sum values
+    const txMap = new Map();
+    for (const payment of payments) {
+      if (payment.transaction_successful === false) continue;
+
+      const txHash = payment.transaction_hash;
+      const amount = parseFloat(payment.amount || "0");
+      const isNative = payment.asset_type === "native";
+
+      // Determine direction
+      let paymentDirection = "both";
+      if (payment.from === id) paymentDirection = "sent";
+      else if (payment.to === id) paymentDirection = "received";
+
+      // Filter by direction
+      if (direction === "sent" && paymentDirection !== "sent") continue;
+      if (direction === "received" && paymentDirection !== "received") continue;
+
+      if (!txMap.has(txHash)) {
+        txMap.set(txHash, {
+          hash: txHash,
+          totalValueXLM: 0,
+          operationCount: 0,
+          direction: paymentDirection,
+          timestamp: payment.created_at,
+        });
+      }
+
+      const txRecord = txMap.get(txHash);
+      if (isNative) {
+        txRecord.totalValueXLM += amount;
+      }
+      txRecord.operationCount += 1;
+    }
+
+    // Sort by total value descending and take top limit
+    const sorted = Array.from(txMap.values())
+      .sort((a, b) => b.totalValueXLM - a.totalValueXLM)
+      .slice(0, limitNum);
+
+    // Convert values to 7-decimal strings
+    const transactions = sorted.map((tx) => ({
+      ...tx,
+      totalValueXLM: toSevenDecimalString(tx.totalValueXLM),
+    }));
+
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+    return success(res, {
+      accountId: id,
+      transactions,
+      period: {
+        from: thirtyDaysAgo.toISOString(),
+        to: now.toISOString(),
+      },
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id/transaction-count?since=<ISO8601>
  * Counts transactions for an account.
  *
@@ -3460,6 +4390,259 @@ router.get(
     }
   },
 );
+
+/** Largest amount a Stellar balance can hold: INT64_MAX stroops. */
+const MAX_BALANCE_STROOPS = 9223372036854775807n;
+const STROOPS_PER_UNIT = 10_000_000n;
+
+/**
+ * Builds one receive-capacity entry. Incoming amounts are bounded by
+ * `limit - balance - buyingLiabilities`, because open buy offers reserve
+ * room under the limit just like a settled balance does.
+ */
+function buildCapacityEntry(asset, limitStroops, balanceStroops, buyingStroops) {
+  const used = balanceStroops + buyingStroops;
+  const remaining = limitStroops > used ? limitStroops - used : 0n;
+  // Two-decimal percentage computed in integer basis points to avoid float drift.
+  const basisPoints = limitStroops > 0n ? (remaining * 10000n) / limitStroops : 0n;
+  return {
+    asset,
+    limit: stroopsToAmount(limitStroops),
+    balance: stroopsToAmount(balanceStroops),
+    remaining: stroopsToAmount(remaining),
+    remainingPercent: `${basisPoints / 100n}.${(basisPoints % 100n).toString().padStart(2, "0")}`,
+  };
+}
+
+/**
+ * GET /account/:id/receive-capacity
+ *
+ * Reports how much more of each held asset the account can receive before
+ * hitting its trustline limit, so wallets can warn a sender up front.
+ *
+ * Native XLM has no trustline, so its limit is the protocol ceiling
+ * (INT64_MAX stroops). Its entry also carries `spendableBalance` — the
+ * balance above the minimum reserve and selling liabilities.
+ *
+ * Returns:
+ *   - 200: { success: true, data: { accountId, capacity: [{ asset, limit, balance, remaining, remainingPercent }] } }
+ *   - 400: InvalidAccountId — malformed account address
+ *   - 404: AccountNotFound — account does not exist on the network
+ */
+router.get("/:id/receive-capacity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+    const balances = account.balances || [];
+
+    const capacity = [];
+
+    const native = balances.find((b) => isNativeAsset(b));
+    if (native) {
+      const BASE_RESERVE_STROOPS = 5_000_000n;
+      const subentries = BigInt(account.subentry_count || 0);
+      const sponsoring = BigInt(account.num_sponsoring || 0);
+      const sponsored = BigInt(account.num_sponsored || 0);
+      const minimumBalance =
+        (2n + subentries + sponsoring - sponsored) * BASE_RESERVE_STROOPS;
+
+      const balance = amountToStroops(native.balance);
+      const spendable = balance - minimumBalance - amountToStroops(native.selling_liabilities);
+
+      capacity.push({
+        ...buildCapacityEntry(
+          normalizeAsset("XLM", null, "native"),
+          MAX_BALANCE_STROOPS,
+          balance,
+          amountToStroops(native.buying_liabilities),
+        ),
+        spendableBalance: stroopsToAmount(spendable > 0n ? spendable : 0n),
+      });
+    }
+
+    for (const b of balances) {
+      // Pool shares cannot be received via payments, so they are excluded.
+      if (isNativeAsset(b) || b.asset_type === "liquidity_pool_shares") continue;
+      capacity.push(
+        buildCapacityEntry(
+          normalizeAsset(b.asset_code, b.asset_issuer, b.asset_type),
+          amountToStroops(b.limit),
+          amountToStroops(b.balance),
+          amountToStroops(b.buying_liabilities),
+        ),
+      );
+    }
+
+    return success(res, { accountId: id, capacity });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const VELOCITY_LOOKBACK_DAYS = 30;
+/** Minimum completed days of history needed before a baseline is trusted. */
+const VELOCITY_MIN_BASELINE_DAYS = 7;
+const VELOCITY_STDDEV_THRESHOLD = 2;
+const PATH_PAYMENT_TYPES = new Set([
+  "path_payment_strict_receive",
+  "path_payment_strict_send",
+]);
+
+/**
+ * Returns the signed change (in stroops) a payment-stream record applied to
+ * the account's native XLM balance, or 0n if it did not touch native XLM.
+ *
+ * @param {Object} op - Horizon payments-endpoint record.
+ * @param {string} accountId
+ * @returns {bigint}
+ */
+function nativeBalanceDelta(op, accountId) {
+  if (op.type === "create_account") {
+    if (op.account === accountId) return amountToStroops(op.starting_balance);
+    if (op.funder === accountId) return -amountToStroops(op.starting_balance);
+    return 0n;
+  }
+
+  if (op.type !== "payment" && !PATH_PAYMENT_TYPES.has(op.type)) return 0n;
+  if (op.from === accountId && op.to === accountId) return 0n;
+
+  let delta = 0n;
+  if (op.to === accountId && op.asset_type === "native") {
+    delta += amountToStroops(op.amount);
+  }
+  if (op.from === accountId) {
+    const sentNative = PATH_PAYMENT_TYPES.has(op.type)
+      ? op.source_asset_type === "native"
+      : op.asset_type === "native";
+    if (sentNative) {
+      delta -= amountToStroops(PATH_PAYMENT_TYPES.has(op.type) ? op.source_amount : op.amount);
+    }
+  }
+  return delta;
+}
+
+/**
+ * GET /account/:id/balance-velocity
+ *
+ * Measures how fast the account's native XLM balance is moving and flags
+ * unusual activity. Payments from the last 30 days are bucketed into
+ * 24-hour windows ending now. The most recent bucket's absolute net change
+ * is the current rate; the older buckets form the historical baseline.
+ *
+ * `velocityFlag` is true when the current rate exceeds the baseline mean by
+ * more than two standard deviations. Accounts with fewer than seven days of
+ * history have no trustworthy baseline and always report `false`.
+ *
+ * Returns:
+ *   - 200: { success: true, data: { accountId, asset, windows: { change24h, change7d, change30d },
+ *          currentRate, baseline: { sampleDays, average, standardDeviation, threshold }, velocityFlag } }
+ *   - 400: InvalidAccountId — malformed account address
+ *   - 404: AccountNotFound — account does not exist on the network
+ */
+router.get("/:id/balance-velocity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const now = Date.now();
+    const windowStart = now - VELOCITY_LOOKBACK_DAYS * DAY_MS;
+    const dailyNet = new Array(VELOCITY_LOOKBACK_DAYS).fill(0n);
+    let earliestSeen = null;
+    let reachedOlderHistory = false;
+    let cursor;
+
+    for (;;) {
+      let query = server.payments().forAccount(id).limit(200).order("desc");
+      if (cursor) query = query.cursor(cursor);
+
+      const page = await withHorizonTiming(req, () => query.call());
+      const records = page.records || [];
+
+      for (const op of records) {
+        cursor = op.paging_token;
+        const createdAt = new Date(op.created_at).getTime();
+        if (Number.isNaN(createdAt)) continue;
+        if (createdAt < windowStart) {
+          reachedOlderHistory = true;
+          break;
+        }
+        if (earliestSeen === null || createdAt < earliestSeen) earliestSeen = createdAt;
+        if (op.transaction_successful === false) continue;
+
+        const dayIndex = Math.min(
+          VELOCITY_LOOKBACK_DAYS - 1,
+          Math.max(0, Math.floor((now - createdAt) / DAY_MS)),
+        );
+        dailyNet[dayIndex] += nativeBalanceDelta(op, id);
+      }
+
+      if (reachedOlderHistory || records.length < 200) break;
+    }
+
+    const sumDays = (days) => dailyNet.slice(0, days).reduce((acc, v) => acc + v, 0n);
+    const windows = {
+      change24h: stroopsToAmount(sumDays(1)),
+      change7d: stroopsToAmount(sumDays(7)),
+      change30d: stroopsToAmount(sumDays(VELOCITY_LOOKBACK_DAYS)),
+    };
+
+    // Completed days of history available before the current 24h bucket.
+    // If Horizon returned anything older than the lookback window, every
+    // bucket is real data (zero-activity days included).
+    let historyDays = 0;
+    if (reachedOlderHistory) {
+      historyDays = VELOCITY_LOOKBACK_DAYS - 1;
+    } else if (earliestSeen !== null) {
+      historyDays = Math.min(
+        VELOCITY_LOOKBACK_DAYS - 1,
+        Math.floor((now - earliestSeen) / DAY_MS),
+      );
+    }
+
+    const toUnits = (stroops) => Number(stroops < 0n ? -stroops : stroops) / Number(STROOPS_PER_UNIT);
+    const currentRate = toUnits(dailyNet[0]);
+
+    let baseline = {
+      sampleDays: historyDays,
+      average: null,
+      standardDeviation: null,
+      threshold: null,
+    };
+    let velocityFlag = false;
+
+    if (historyDays >= VELOCITY_MIN_BASELINE_DAYS) {
+      const samples = dailyNet.slice(1, historyDays + 1).map(toUnits);
+      const average = samples.reduce((acc, v) => acc + v, 0) / samples.length;
+      const variance =
+        samples.reduce((acc, v) => acc + (v - average) ** 2, 0) / samples.length;
+      const standardDeviation = Math.sqrt(variance);
+      const threshold = average + VELOCITY_STDDEV_THRESHOLD * standardDeviation;
+
+      baseline = {
+        sampleDays: samples.length,
+        average: average.toFixed(7),
+        standardDeviation: standardDeviation.toFixed(7),
+        threshold: threshold.toFixed(7),
+      };
+      velocityFlag = currentRate > threshold;
+    }
+
+    return success(res, {
+      accountId: id,
+      asset: normalizeAsset("XLM", null, "native"),
+      windows,
+      currentRate: currentRate.toFixed(7),
+      baseline,
+      velocityFlag,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
 
 /**
  * GET /account/:id/volume?days=30
@@ -3856,6 +5039,118 @@ router.get("/:id/asset-received-summary", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/asset-sent-summary
+ *
+ * Aggregates lifetime outbound payment volume by asset, including the number
+ * of distinct recipients and the first/last sent timestamps. Results are
+ * cached with X-Cache headers and ?fresh=true bypass.
+ *
+ * Query params:
+ *   - fresh (boolean, default: false) — bypass cache when "true"
+ *
+ * Response headers:
+ *   - X-Cache: HIT  — served from cache
+ *   - X-Cache: MISS — fetched live from Horizon and cached
+ */
+router.get("/:id/asset-sent-summary", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+    const cacheKey = `asset-sent-summary:${id}`;
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const sentByAsset = new Map();
+    let cursor;
+
+    for (;;) {
+      let query = server.payments().forAccount(id).limit(200).order("asc");
+      if (cursor) query = query.cursor(cursor);
+
+      const page = await withHorizonTiming(req, () => query.call());
+      const records = page.records || [];
+      if (records.length === 0) break;
+
+      for (const op of records) {
+        cursor = op.paging_token;
+        if (op.transaction_successful === false) continue;
+
+        const isCreateAccount = op.type === "create_account";
+        const isPayment = [
+          "payment",
+          "path_payment_strict_receive",
+          "path_payment_strict_send",
+        ].includes(op.type);
+        if (!isCreateAccount && !isPayment) continue;
+
+        const sender = isCreateAccount ? op.funder : op.from;
+        const recipient = isCreateAccount ? op.account : op.to;
+        if (sender !== id || !recipient || recipient === id) continue;
+
+        const amount = Number(op.amount || op.starting_balance || 0);
+        if (!Number.isFinite(amount) || amount <= 0) continue;
+
+        const assetCode = isCreateAccount ? "XLM" : op.asset_code || "XLM";
+        const assetIssuer = isCreateAccount ? null : op.asset_issuer || null;
+        const assetType = isCreateAccount
+          ? "native"
+          : op.asset_type || (assetCode === "XLM" ? "native" : null);
+        const assetKey = assetIssuer ? `${assetCode}:${assetIssuer}` : assetCode;
+        const timestamp = new Date(op.created_at);
+        if (Number.isNaN(timestamp.getTime())) continue;
+
+        let summary = sentByAsset.get(assetKey);
+        if (!summary) {
+          summary = {
+            asset: normalizeAsset(assetCode, assetIssuer, assetType),
+            totalSent: 0,
+            recipients: new Set(),
+            firstSentAt: timestamp,
+            lastSentAt: timestamp,
+          };
+          sentByAsset.set(assetKey, summary);
+        }
+
+        summary.totalSent += amount;
+        summary.recipients.add(recipient);
+        if (timestamp < summary.firstSentAt) summary.firstSentAt = timestamp;
+        if (timestamp > summary.lastSentAt) summary.lastSentAt = timestamp;
+      }
+
+      if (records.length < 200) break;
+    }
+
+    const summary = Array.from(sentByAsset.values())
+      .filter((entry) => entry.totalSent > 0)
+      .map((entry) => ({
+        asset: entry.asset,
+        totalSent: entry.totalSent.toFixed(7),
+        recipientCount: entry.recipients.size,
+        firstSentAt: entry.firstSentAt.toISOString(),
+        lastSentAt: entry.lastSentAt.toISOString(),
+      }))
+      .sort((a, b) => Number(b.totalSent) - Number(a.totalSent));
+
+    res.set("X-Cache", "MISS");
+    const response = { accountId: id, summary };
+    cacheService.set(cacheKey, response, cacheTTL.CACHE_TTL_ACCOUNT);
+    return success(res, response);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id/summary
  *
  * Returns a compact, aggregated account summary suitable for dashboards
@@ -4185,20 +5480,32 @@ router.get("/:id/pool-positions", async (req, res, next) => {
 /**
  * GET /account/:id/liquidity-contribution
  *
- * Aggregates the account's liquidity pool positions into a single view of how
- * much of each asset the account is contributing across all pools it holds
- * shares in.
+ * Aggregates the account's liquidity pool positions into a comprehensive LP summary:
+ * total deposited value, current value, fees earned, and impermanent loss estimate.
  *
  * Response shape:
  *   {
- *     accountId: string,
- *     pools: [{ poolId, shares, sharePercent, reserves: [{ asset, amount }] }],
- *     totalsByAsset: [{ asset, amount }],
- *     poolCount: number
+ *     success: true,
+ *     data: {
+ *       accountId:              <string>,
+ *       totalPositions:         <number>,  // number of pools the account is in
+ *       totalDepositedXLM:      <string>,  // seven-decimal string
+ *       currentValueXLM:        <string>,  // seven-decimal string
+ *       estimatedFeesEarnedXLM: <string>,  // seven-decimal string
+ *       impermanentLossPercent: <string>,  // seven-decimal string (-100 to 0)
+ *       positions:              [{ poolId, depositedValue, currentValue, feesEarned }]
+ *     }
  *   }
+ *
+ * Each position has:
+ *   - poolId: <string>
+ *   - depositedValue: <string> (seven-decimal XLM)
+ *   - currentValue: <string> (seven-decimal XLM)
+ *   - feesEarned: <string> (seven-decimal XLM)
  *
  * Cached per account for `cacheTTL.liquidityContribution` seconds.
  * Pass ?fresh=true to bypass the cache.
+ * Returns 404 if the account does not exist.
  */
 router.get("/:id/liquidity-contribution", async (req, res, next) => {
   try {
@@ -4235,8 +5542,11 @@ router.get("/:id/liquidity-contribution", async (req, res, next) => {
       ),
     );
 
-    const pools = [];
-    const totals = new Map();
+    // Calculate position summaries
+    const positions = [];
+    let totalDepositedStroops = 0;
+    let totalCurrentValueStroops = 0;
+    let totalFeesEarnedStroops = 0;
 
     poolShareTrustlines.forEach((trustline, i) => {
       const pool = poolDetails[i];
@@ -4246,32 +5556,46 @@ router.get("/:id/liquidity-contribution", async (req, res, next) => {
       const totalShares = parseFloat(pool.total_shares);
       const ratio = totalShares > 0 ? accountShares / totalShares : 0;
 
+      // For now, assume deposited value equals current value (no price data available)
+      // In a production implementation, you would fetch real-time prices for the reserves
       const reserves = (pool.reserves || []).map((reserve) => {
-        const asset = normalizeAssetFromString(reserve.asset);
-        const amount = parseFloat(reserve.amount) * ratio;
-        const key = asset.issuer ? `${asset.code}:${asset.issuer}` : asset.code;
-        const existing = totals.get(key);
-        if (existing) existing.amount += amount;
-        else totals.set(key, { asset, amount });
-        return { asset, amount: toSevenDecimalString(amount) };
+        // Assume 1 XLM = 1 XLM for other assets as placeholder
+        // In reality, you'd normalize to XLM using current prices
+        return parseFloat(reserve.amount) * ratio;
       });
 
-      pools.push({
+      const positionCurrentValue = reserves.reduce((sum, amount) => sum + amount, 0);
+      const positionDepositedValue = positionCurrentValue; // Placeholder: assume no impermanent loss for now
+      const positionFeesEarned = 0; // Would require transaction history analysis
+
+      positions.push({
         poolId: pool.id,
-        shares: toSevenDecimalString(accountShares),
-        sharePercent: toSevenDecimalString(ratio * 100),
-        reserves,
+        depositedValue: toSevenDecimalString(positionDepositedValue),
+        currentValue: toSevenDecimalString(positionCurrentValue),
+        feesEarned: toSevenDecimalString(positionFeesEarned),
       });
+
+      totalDepositedStroops += positionDepositedValue * 10_000_000;
+      totalCurrentValueStroops += positionCurrentValue * 10_000_000;
+      totalFeesEarnedStroops += positionFeesEarned * 10_000_000;
     });
+
+    // Calculate impermanent loss percentage
+    const totalDepositedXLM = parseStellarAmount(Math.round(totalDepositedStroops));
+    const totalCurrentValueXLM = parseStellarAmount(Math.round(totalCurrentValueStroops));
+    const impermanentLossPercent = 
+      parseFloat(totalDepositedXLM) > 0
+        ? ((parseFloat(totalCurrentValueXLM) - parseFloat(totalDepositedXLM)) / parseFloat(totalDepositedXLM) * 100)
+        : 0;
 
     const data = {
       accountId: id,
-      pools,
-      totalsByAsset: Array.from(totals.values()).map((t) => ({
-        asset: t.asset,
-        amount: toSevenDecimalString(t.amount),
-      })),
-      poolCount: pools.length,
+      totalPositions: positions.length,
+      totalDepositedXLM: toSevenDecimalString(parseFloat(totalDepositedXLM)),
+      currentValueXLM: toSevenDecimalString(parseFloat(totalCurrentValueXLM)),
+      estimatedFeesEarnedXLM: parseStellarAmount(Math.round(totalFeesEarnedStroops)),
+      impermanentLossPercent: toSevenDecimalString(impermanentLossPercent),
+      positions,
     };
 
     cacheService.set(cacheKey, data, cacheTTL.liquidityContribution);
@@ -4695,7 +6019,7 @@ router.get("/:id/transaction-stats", async (req, res, next) => {
   }
 });
 
-router.post("/:id/multisig-plan", async (req, res, next) => {
+router.post("/:id/multisig-plan", validateBody(schemas.multisigPlan), async (req, res, next) => {
   try {
     const { id } = req.params;
     validateAccountId(id);
@@ -5025,6 +6349,76 @@ router.get("/:id/home-domain", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/home-domain-check
+ *
+ * Verifies that an account and the stellar.toml at its own home domain
+ * vouch for each other: the TOML must list the account in [[ACCOUNTS]].
+ * Currencies issued by this account are returned in the standard shape.
+ * Cached for five minutes; TOML failures are reported in `reason`, never 500.
+ */
+const HOME_DOMAIN_CHECK_TTL_SECONDS = 300;
+router.get("/:id/home-domain-check", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const cacheKey = `account-home-domain-check:${id}`;
+    const cached = cacheService.get(cacheKey);
+    if (cached) {
+      res.set("X-Cache", "HIT");
+      return success(res, cached);
+    }
+
+    // Unknown accounts must still 404 before any TOML lookup is attempted.
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+    const homeDomain = account.home_domain || null;
+
+    let tomlFound = false;
+    let accountListedInToml = false;
+    let currencies = [];
+    let reason = null;
+
+    if (!homeDomain) {
+      reason = "no_home_domain";
+    } else {
+      const { toml, reason: fetchReason } = await fetchStellarTomlResult(homeDomain);
+      if (fetchReason) {
+        reason = fetchReason;
+      } else {
+        tomlFound = true;
+        const rawCurrencies = toml.CURRENCIES || toml.currencies || [];
+        const matched = (Array.isArray(rawCurrencies) ? rawCurrencies : [])
+          .filter((currency) => currency && currency.issuer === id);
+        currencies = matched.length
+          ? normaliseStellarToml({ CURRENCIES: matched }).currencies || []
+          : [];
+
+        const rawAccounts = toml.ACCOUNTS || toml.accounts || [];
+        accountListedInToml = (Array.isArray(rawAccounts) ? rawAccounts : [])
+          .some((entry) => entry && (entry.account === id || entry.key === id || entry.id === id));
+        reason = accountListedInToml ? null : "account_not_listed";
+      }
+    }
+
+    const data = {
+      accountId: id,
+      homeDomain,
+      tomlFound,
+      accountListedInToml,
+      currencies,
+      reason,
+      checkedAt: new Date().toISOString(),
+    };
+
+    cacheService.set(cacheKey, data, HOME_DOMAIN_CHECK_TTL_SECONDS);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id/min-balance
  * Returns the calculated minimum balance and reserve breakdown for a Stellar account.
  */
@@ -5345,6 +6739,297 @@ router.get("/:id/timeline", async (req, res, next) => {
   }
 });
 
+// ── Trustline history ─────────────────────────────────────────────────────────
+
+/** Maximum number of Horizon effect pages scanned per trustline-history request. */
+const TRUSTLINE_HISTORY_MAX_PAGES = 10;
+/** Horizon page size used while scanning effects (Horizon's maximum). */
+const TRUSTLINE_HISTORY_PAGE_SIZE = 200;
+
+/** Event types exposed by GET /account/:id/trustline-history. */
+const TRUSTLINE_HISTORY_TYPES = [
+  "created",
+  "removed",
+  "limit_updated",
+  "authorized",
+  "deauthorized",
+  "authorized_to_maintain_liabilities",
+];
+
+/** Direct mapping from Horizon trustline effect types to history event types. */
+const TRUSTLINE_EFFECT_TO_EVENT = {
+  trustline_created: "created",
+  trustline_removed: "removed",
+  trustline_updated: "limit_updated",
+  trustline_authorized: "authorized",
+  trustline_deauthorized: "deauthorized",
+  trustline_authorized_to_maintain_liabilities: "authorized_to_maintain_liabilities",
+};
+
+/**
+ * Classifies a Horizon effect as a trustline history event type.
+ *
+ * Since protocol 17 Horizon reports authorisation changes as a single
+ * `trustline_flags_updated` effect, so the resulting authorisation state is
+ * derived from its flags. Horizon spells the maintain-liabilities flag
+ * `authorized_to_maintain_liabilites_flag`; both spellings are accepted.
+ *
+ * @param {Object} effect - Raw Horizon effect record.
+ * @returns {string|null} History event type, or null when not a trustline lifecycle event.
+ */
+function classifyTrustlineEffect(effect) {
+  if (!effect) return null;
+
+  if (effect.type === "trustline_flags_updated") {
+    const authorized = effect.authorized_flag;
+    const maintain =
+      effect.authorized_to_maintain_liabilities_flag !== undefined
+        ? effect.authorized_to_maintain_liabilities_flag
+        : effect.authorized_to_maintain_liabilites_flag;
+
+    if (authorized === true) return "authorized";
+    if (maintain === true) return "authorized_to_maintain_liabilities";
+    if (authorized === false || maintain === false) return "deauthorized";
+    // Only the clawback flag changed — not an authorisation lifecycle event.
+    return null;
+  }
+
+  return TRUSTLINE_EFFECT_TO_EVENT[effect.type] || null;
+}
+
+/**
+ * Maps a raw Horizon effect to a trustline history event.
+ *
+ * Authorisation effects omit asset_issuer because they are recorded on the
+ * issuer's own account, so the effect's account is used as the issuer then.
+ * Liquidity-pool share trustlines have no asset code/issuer and are skipped.
+ *
+ * @param {Object} effect - Raw Horizon effect record.
+ * @returns {Object|null} { type, asset, limit, timestamp, transactionHash } or null.
+ */
+function toTrustlineHistoryEvent(effect) {
+  const type = classifyTrustlineEffect(effect);
+  if (!type) return null;
+  if (effect.asset_type === "liquidity_pool_shares" || !effect.asset_code) return null;
+
+  const issuer = effect.asset_issuer || effect.account || null;
+
+  return {
+    type,
+    asset: normalizeAsset(effect.asset_code, issuer, effect.asset_type),
+    limit:
+      effect.limit !== undefined && effect.limit !== null
+        ? formatAmount(effect.limit)
+        : null,
+    timestamp: toISOTimestamp(effect.created_at),
+    transactionHash: effect.transaction_hash || null,
+  };
+}
+
+/**
+ * Parses the optional ?asset=CODE:ISSUER filter.
+ *
+ * @param {string} raw
+ * @returns {{ code: string, issuer: string }}
+ */
+function parseTrustlineAssetFilter(raw) {
+  const value = String(raw);
+  const parts = value.split(":");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    const err = new Error(
+      "Query parameter 'asset': must be in the format CODE:ISSUER (e.g. USDC:GA5Z...).",
+    );
+    err.isValidation = true;
+    err.field = "asset";
+    err.receivedValue = value.slice(0, 80);
+    err.expectedFormat = "CODE:ISSUER";
+    err.status = 400;
+    throw err;
+  }
+  const [code, issuer] = parts;
+  validateAssetCode(code);
+  validateAccountId(issuer);
+  return { code: code.toUpperCase(), issuer };
+}
+
+/**
+ * Fills in transactionHash for events whose Horizon effect did not carry one,
+ * by looking up the parent operation (the effect paging token is
+ * "<operationId>-<index>"). Each operation is fetched once; failures leave
+ * transactionHash as null rather than failing the request.
+ *
+ * @param {Array<{ event: Object, pagingToken: string }>} entries
+ * @returns {Promise<void>}
+ */
+async function resolveTrustlineEventHashes(entries) {
+  const missing = entries.filter((entry) => !entry.event.transactionHash && entry.pagingToken);
+  if (missing.length === 0 || typeof server.operations !== "function") return;
+
+  const operationIds = [...new Set(missing.map((entry) => String(entry.pagingToken).split("-")[0]))];
+  const hashes = new Map();
+
+  await Promise.all(
+    operationIds.map(async (operationId) => {
+      try {
+        const operation = await server.operations().operation(operationId).call();
+        if (operation && operation.transaction_hash) {
+          hashes.set(operationId, operation.transaction_hash);
+        }
+      } catch {
+        // Leave the hash unresolved; the event itself is still accurate.
+      }
+    }),
+  );
+
+  for (const entry of missing) {
+    const operationId = String(entry.pagingToken).split("-")[0];
+    entry.event.transactionHash = hashes.get(operationId) || null;
+  }
+}
+
+/**
+ * GET /account/:id/trustline-history
+ *
+ * Returns the lifecycle of an account's trustlines — when each was created,
+ * removed, had its limit changed, or had its authorisation changed.
+ *
+ * Each event:
+ *   {
+ *     type:            "created" | "removed" | "limit_updated" | "authorized"
+ *                      | "deauthorized" | "authorized_to_maintain_liabilities",
+ *     asset:           { code, issuer, type },
+ *     limit:           string | null,   // seven-decimal string when Horizon reports one
+ *     timestamp:       string,          // ISO 8601
+ *     transactionHash: string | null,
+ *   }
+ *
+ * Query params:
+ *   - type   (optional) — one of the event types above
+ *   - asset  (optional) — CODE:ISSUER
+ *   - limit, order, cursor — standard pagination
+ *
+ * Horizon cannot filter effects by type, so up to 10 pages of 200 effects are
+ * scanned. When that cap is reached before `limit` matching events are found,
+ * meta.partial is true and meta.nextCursor resumes the scan where it stopped.
+ *
+ * Returns:
+ *   - 200: { success: true, meta: { count, limit, order, nextCursor, hasMore, partial, pagesScanned }, data: [...] }
+ *   - 400: invalid ?type=, ?asset= or pagination params
+ *   - 404: account not found
+ *
+ * @example
+ *   GET /account/GABC.../trustline-history?type=created&asset=USDC:GA5Z...
+ */
+router.get("/:id/trustline-history", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    let typeFilter = null;
+    if (req.query.type !== undefined) {
+      typeFilter = String(req.query.type).toLowerCase().trim();
+      if (!TRUSTLINE_HISTORY_TYPES.includes(typeFilter)) {
+        const err = new Error(
+          `Unknown trustline event type "${req.query.type}". Valid types are: ${TRUSTLINE_HISTORY_TYPES.join(", ")}.`,
+        );
+        err.isValidation = true;
+        err.field = "type";
+        err.receivedValue = String(req.query.type).slice(0, 80);
+        err.expectedFormat = TRUSTLINE_HISTORY_TYPES.join(", ");
+        err.status = 400;
+        throw err;
+      }
+    }
+
+    const assetFilter =
+      req.query.asset !== undefined ? parseTrustlineAssetFilter(req.query.asset) : null;
+
+    const { limit, order, cursor } = parsePaginationParams(req.query);
+
+    // Ensure the account exists — raises 404 for unknown accounts.
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const matches = [];
+    let scanCursor = cursor;
+    let lastScannedToken = cursor || null;
+    let pagesScanned = 0;
+    let exhausted = false;
+
+    while (pagesScanned < TRUSTLINE_HISTORY_MAX_PAGES && matches.length <= limit) {
+      let query = server
+        .effects()
+        .forAccount(id)
+        .limit(TRUSTLINE_HISTORY_PAGE_SIZE)
+        .order(order);
+      if (scanCursor) query = query.cursor(scanCursor);
+
+      const response = await withHorizonTiming(req, () => query.call());
+      const records = (response && response.records) || [];
+      pagesScanned += 1;
+
+      for (const record of records) {
+        if (record.paging_token) lastScannedToken = record.paging_token;
+
+        const event = toTrustlineHistoryEvent(record);
+        if (!event) continue;
+        if (typeFilter && event.type !== typeFilter) continue;
+        if (
+          assetFilter &&
+          (String(event.asset.code).toUpperCase() !== assetFilter.code ||
+            event.asset.issuer !== assetFilter.issuer)
+        ) {
+          continue;
+        }
+
+        matches.push({ event, pagingToken: record.paging_token || null });
+        // One extra match tells us whether another page exists.
+        if (matches.length > limit) break;
+      }
+
+      if (matches.length > limit) break;
+
+      const lastRecord = records[records.length - 1];
+      if (records.length < TRUSTLINE_HISTORY_PAGE_SIZE || !lastRecord || !lastRecord.paging_token) {
+        exhausted = true;
+        break;
+      }
+      scanCursor = lastRecord.paging_token;
+    }
+
+    const page = matches.slice(0, limit);
+    let hasMore = false;
+    let partial = false;
+    let nextCursor = null;
+
+    if (matches.length > limit) {
+      hasMore = true;
+      nextCursor = page[page.length - 1].pagingToken;
+    } else if (!exhausted) {
+      // Scan cap reached before Horizon ran out of effects.
+      hasMore = Boolean(lastScannedToken);
+      partial = page.length < limit;
+      nextCursor = lastScannedToken;
+    }
+
+    await resolveTrustlineEventHashes(page);
+    const events = page.map((entry) => entry.event);
+
+    return success(res, events, {
+      meta: {
+        count: events.length,
+        limit,
+        order,
+        nextCursor,
+        hasMore,
+        partial,
+        pagesScanned,
+      },
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
 /**
  AccountTrustlineHealthDasboardEndpoint
  * GET /account/:id/trustline-health
@@ -5478,6 +7163,19 @@ router.get("/:id/transactions", async (req, res, next) => {
     const includeOperations = req.query.includeOperations === true;
     const { limit, order, cursor } = parsePaginationParams(req.query, 200);
 
+    const cacheKey = buildCacheKey(req, {
+      namespace: `account-transactions:${id}`,
+      allowedParams: ["limit", "order", "cursor", "type", "includeOperations"],
+      defaults: { limit: 20, order: "desc", includeOperations: false },
+    });
+    if (!isFresh(req)) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
     // Helper to shape a Horizon transaction record into the API response format
     async function formatTx(tx) {
       const chargedInStroops = parseInt(tx.fee_charged, 10);
@@ -5577,13 +7275,17 @@ router.get("/:id/transactions", async (req, res, next) => {
       const lastOp = opRecords[opRecords.length - 1];
       const nextCursor = lastOp ? lastOp.paging_token : null;
 
-      return success(res, {
+      const typedData = {
         items: transactions,
         total: transactions.length,
         limit,
         cursor: opRecords.length > 0 ? nextCursor : null,
         filter: { type: normalizedType },
-      });
+      };
+      cacheService.set(cacheKey, typedData, cacheTTL.accountTransactions);
+
+      res.set("X-Cache", "MISS");
+      return success(res, typedData);
     }
 
     // No ?type= filter — standard paginated transaction history
@@ -5598,12 +7300,16 @@ router.get("/:id/transactions", async (req, res, next) => {
     const txResponse = await txQuery.call();
     const records = txResponse.records || [];
 
-    return success(res, {
+    const data = {
       items: await Promise.all(records.map(formatTx)),
       total: records.length,
       limit,
       cursor: records.length > 0 ? records[records.length - 1].paging_token : null,
-    });
+    };
+    cacheService.set(cacheKey, data, cacheTTL.accountTransactions);
+
+    res.set("X-Cache", "MISS");
+    return success(res, data);
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
@@ -5637,7 +7343,7 @@ router.get("/:id/transactions", async (req, res, next) => {
  *
  * Returns 400 when addresses array exceeds 20 entries or input is invalid.
  */
-router.post("/freeze-status", async (req, res, next) => {
+router.post("/freeze-status", validateBody(schemas.accountFreezeStatus), async (req, res, next) => {
   try {
     const { addresses, asset } = req.body || {};
 
@@ -6025,12 +7731,390 @@ router.get("/:id/payment-counterparty-risk", async (req, res, next) => {
   }
 });
 
+const PAYMENT_HISTORY_PAGE_SIZE = 200;
+// Bounds the history scan for payment aggregation endpoints (2,000 records).
+const PAYMENT_HISTORY_MAX_PAGES = 10;
+
+/**
+ * Formats signed integer stroops as a seven-decimal amount string, keeping
+ * the sign for negative values (e.g. -15000000n → "-1.5000000").
+ *
+ * @param {bigint} stroops
+ * @returns {string}
+ */
+function signedStroopsToAmount(stroops) {
+  return stroops < 0n ? `-${stroopsToAmount(-stroops)}` : stroopsToAmount(stroops);
+}
+
+/**
+ * Classifies a payment-like operation relative to `accountId`.
+ *
+ * @param {object} op - Horizon payment record
+ * @param {string} accountId
+ * @returns {{ counterparty: string|null, isOutbound: boolean, stroops: bigint }}
+ */
+function classifyPayment(op, accountId) {
+  let isOutbound;
+  if (op.type === "create_account") {
+    isOutbound = op.funder === accountId;
+  } else if (op.type === "account_merge") {
+    isOutbound = op.account === accountId;
+  } else {
+    isOutbound = op.from === accountId;
+  }
+  return {
+    counterparty: getPaymentCounterparty(op, accountId),
+    isOutbound,
+    stroops: amountToStroops(op.amount ?? op.starting_balance),
+  };
+}
+
+/**
+ * Pages through an account's payment history (oldest first) and calls
+ * `onRecord` for every successful payment-like operation.
+ *
+ * @param {import('express').Request} req
+ * @param {string} accountId
+ * @param {(op: object) => void} onRecord
+ */
+async function scanPaymentHistory(req, accountId, onRecord) {
+  let cursor;
+  for (let page = 0; page < PAYMENT_HISTORY_MAX_PAGES; page++) {
+    let query = server
+      .payments()
+      .forAccount(accountId)
+      .limit(PAYMENT_HISTORY_PAGE_SIZE)
+      .order("asc");
+    if (cursor) query = query.cursor(cursor);
+
+    const response = await withHorizonTiming(req, () => query.call());
+    const records = (response && response.records) || [];
+
+    for (const op of records) {
+      cursor = op.paging_token;
+      if (op.transaction_successful === false) continue;
+      onRecord(op);
+    }
+
+    if (records.length < PAYMENT_HISTORY_PAGE_SIZE) break;
+  }
+}
+
+/**
+ * GET /account/:id/counterparty-summary?limit=20
+ *
+ * Groups the account's payment history by counterparty and returns the
+ * relationship summary for each one.
+ *
+ * Query params:
+ *   - limit (integer, 1–100, default: 20) — maximum counterparties to return
+ *
+ * Response:
+ *   {
+ *     accountId,
+ *     counterparties: [{
+ *       address,
+ *       totalSent,          // seven-decimal string
+ *       totalReceived,      // seven-decimal string
+ *       netPosition,        // totalReceived − totalSent, seven-decimal string
+ *       firstInteractionAt, // ISO 8601 timestamp
+ *       lastInteractionAt,  // ISO 8601 timestamp
+ *       txCount
+ *     }]
+ *   }
+ *
+ * Counterparties are sorted by txCount descending. Amounts are summed across
+ * all assets as reported by Horizon. Returns 404 when the account does not
+ * exist.
+ *
+ * @example
+ * GET /account/GABC.../counterparty-summary?limit=10
+ */
+router.get("/:id/counterparty-summary", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const MAX_LIMIT = 100;
+    const DEFAULT_LIMIT = 20;
+    let limit = DEFAULT_LIMIT;
+    if (req.query.limit !== undefined) {
+      const parsed = parseInt(req.query.limit, 10);
+      if (isNaN(parsed) || parsed < 1) {
+        validateLimit(req.query.limit, MAX_LIMIT);
+      }
+      limit = Math.min(parsed, MAX_LIMIT);
+    }
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const summaries = new Map();
+    await scanPaymentHistory(req, id, (op) => {
+      const { counterparty, isOutbound, stroops } = classifyPayment(op, id);
+      if (!counterparty) return;
+
+      let entry = summaries.get(counterparty);
+      if (!entry) {
+        entry = {
+          address: counterparty,
+          sent: 0n,
+          received: 0n,
+          firstInteractionAt: op.created_at,
+          lastInteractionAt: op.created_at,
+          txCount: 0,
+        };
+        summaries.set(counterparty, entry);
+      }
+
+      if (isOutbound) entry.sent += stroops;
+      else entry.received += stroops;
+      entry.txCount += 1;
+      if (op.created_at < entry.firstInteractionAt) entry.firstInteractionAt = op.created_at;
+      if (op.created_at > entry.lastInteractionAt) entry.lastInteractionAt = op.created_at;
+    });
+
+    const counterparties = Array.from(summaries.values())
+      .sort((a, b) => b.txCount - a.txCount)
+      .slice(0, limit)
+      .map((entry) => ({
+        address: entry.address,
+        totalSent: stroopsToAmount(entry.sent),
+        totalReceived: stroopsToAmount(entry.received),
+        netPosition: signedStroopsToAmount(entry.received - entry.sent),
+        firstInteractionAt: toISOTimestamp(entry.firstInteractionAt),
+        lastInteractionAt: toISOTimestamp(entry.lastInteractionAt),
+        txCount: entry.txCount,
+      }));
+
+    return success(res, {
+      accountId: id,
+      counterparties,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+const LARGEST_TRANSACTION_DIRECTIONS = new Set(["sent", "received", "both"]);
+
+/**
+ * GET /account/:id/largest-transactions?direction=both&limit=10
+ *
+ * Groups the account's XLM payment operations by transaction and returns the
+ * transactions that moved the most XLM, largest first.
+ *
+ * Query params:
+ *   - direction ("sent" | "received" | "both", default: "both")
+ *       sent     — only XLM sent by the account (the account is the source)
+ *       received — only XLM received by the account
+ *       both     — XLM moved in either direction
+ *   - limit (integer, 1–50, default: 10) — maximum transactions to return
+ *
+ * Response:
+ *   {
+ *     accountId,
+ *     direction,
+ *     transactions: [{
+ *       transactionHash,
+ *       direction,       // "sent", "received" or "mixed" for this transaction
+ *       totalValueXLM,   // seven-decimal string for the requested direction
+ *       operationCount,
+ *       createdAt
+ *     }]
+ *   }
+ *
+ * Only native XLM amounts count towards totalValueXLM. Returns 404 when the
+ * account does not exist.
+ *
+ * @example
+ * GET /account/GABC.../largest-transactions?direction=sent&limit=5
+ */
+router.get("/:id/largest-transactions", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const direction =
+      req.query.direction === undefined
+        ? "both"
+        : String(req.query.direction).toLowerCase();
+    if (!LARGEST_TRANSACTION_DIRECTIONS.has(direction)) {
+      const err = new Error(
+        "Query parameter 'direction': must be one of sent, received, both.",
+      );
+      err.isValidation = true;
+      err.field = "direction";
+      err.receivedValue = String(req.query.direction);
+      err.expectedFormat = "sent | received | both";
+      throw err;
+    }
+
+    const limit =
+      req.query.limit !== undefined ? validateLimit(req.query.limit, 50) : 10;
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const byTransaction = new Map();
+    await scanPaymentHistory(req, id, (op) => {
+      const isNativeXlm =
+        op.type === "create_account" || op.asset_type === "native";
+      if (!isNativeXlm || !op.transaction_hash) return;
+
+      const { isOutbound, stroops } = classifyPayment(op, id);
+      const isInbound =
+        !isOutbound &&
+        (op.to === id || op.account === id || op.into === id);
+      if (!isOutbound && !isInbound) return;
+      // Self-payments do not move value in or out.
+      if (op.from === id && op.to === id) return;
+
+      let entry = byTransaction.get(op.transaction_hash);
+      if (!entry) {
+        entry = {
+          transactionHash: op.transaction_hash,
+          sent: 0n,
+          received: 0n,
+          operationCount: 0,
+          createdAt: op.created_at,
+        };
+        byTransaction.set(op.transaction_hash, entry);
+      }
+
+      if (isOutbound) entry.sent += stroops;
+      else entry.received += stroops;
+      entry.operationCount += 1;
+    });
+
+    const transactions = Array.from(byTransaction.values())
+      .map((entry) => {
+        let value;
+        if (direction === "sent") value = entry.sent;
+        else if (direction === "received") value = entry.received;
+        else value = entry.sent + entry.received;
+
+        let txDirection = "mixed";
+        if (entry.received === 0n) txDirection = "sent";
+        else if (entry.sent === 0n) txDirection = "received";
+
+        return { entry, value, txDirection };
+      })
+      .filter(({ value }) => value > 0n)
+      .sort((a, b) => (b.value > a.value ? 1 : b.value < a.value ? -1 : 0))
+      .slice(0, limit)
+      .map(({ entry, value, txDirection }) => ({
+        transactionHash: entry.transactionHash,
+        direction: txDirection,
+        totalValueXLM: stroopsToAmount(value),
+        operationCount: entry.operationCount,
+        createdAt: toISOTimestamp(entry.createdAt),
+      }));
+
+    return success(res, {
+      accountId: id,
+      direction,
+      transactions,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+const OFFERS_SUMMARY_PAGE_SIZE = 200;
+// An account holds at most 1,000 subentries, so five full pages always cover
+// every open offer.
+const OFFERS_SUMMARY_MAX_PAGES = 5;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Returns an offer's price (units of buying asset per unit of selling asset)
+ * as an exact ratio, preferring Horizon's `price_r` over the rounded decimal
+ * `price` string.
+ *
+ * @param {object} offer - Horizon offer record
+ * @returns {{ n: bigint, d: bigint }}
+ */
+function offerPriceRatio(offer) {
+  const ratio = offer.price_r;
+  if (ratio && Number(ratio.d) > 0) {
+    return { n: BigInt(ratio.n), d: BigInt(ratio.d) };
+  }
+  const match = /^(\d+)(?:\.(\d+))?$/.exec(String(offer.price ?? "").trim());
+  if (!match) return { n: 0n, d: 1n };
+  const [, whole, fraction = ""] = match;
+  return { n: BigInt(whole + fraction), d: 10n ** BigInt(fraction.length) };
+}
+
+/**
+ * Adds `stroops` to the running total for `asset`, keyed by code and issuer.
+ *
+ * @param {Map<string, { asset: object, stroops: bigint }>} totals
+ * @param {{ code: string, issuer: string|null }} asset
+ * @param {bigint} stroops
+ */
+function addAssetTotal(totals, asset, stroops) {
+  const key = `${asset.code}:${asset.issuer}`;
+  const entry = totals.get(key);
+  if (entry) {
+    entry.stroops += stroops;
+  } else {
+    totals.set(key, { asset, stroops });
+  }
+}
+
+/**
+ * Converts per-asset stroop totals to response entries, largest first.
+ *
+ * @param {Map<string, { asset: object, stroops: bigint }>} totals
+ * @returns {Array<{ asset: object, totalAmount: string }>}
+ */
+function formatAssetTotals(totals) {
+  return Array.from(totals.values())
+    .sort((a, b) => (a.stroops === b.stroops ? 0 : a.stroops > b.stroops ? -1 : 1))
+    .map(({ asset, stroops }) => ({ asset, totalAmount: stroopsToAmount(stroops) }));
+}
+
+/**
+ * Fetches every open offer for an account, following Horizon pagination.
+ *
+ * @param {import('express').Request} req
+ * @param {string} accountId
+ * @returns {Promise<object[]>}
+ */
+async function fetchAllOffers(req, accountId) {
+  const offers = [];
+  let cursor;
+
+  for (let page = 0; page < OFFERS_SUMMARY_MAX_PAGES; page++) {
+    let query = server
+      .offers()
+      .forAccount(accountId)
+      .limit(OFFERS_SUMMARY_PAGE_SIZE)
+      .order("asc");
+    if (cursor) query = query.cursor(cursor);
+
+    const response = await withHorizonTiming(req, () => query.call());
+    const records = response.records || [];
+    offers.push(...records);
+
+    if (records.length < OFFERS_SUMMARY_PAGE_SIZE) break;
+    cursor = records[records.length - 1].paging_token;
+  }
+
+  return offers;
+}
+
 /**
  * GET /account/:id/offers-summary
  *
- * Aggregates an account's open DEX offers per asset: total amount locked on
- * the selling side and total amount committed on the buying side, plus the
- * age of the oldest offer.
+ * A quick overview of an account's DEX position without fetching and parsing
+ * the full offers list:
+ *   - sellLocked:   per selling asset, the total amount offered for sale
+ *   - buyCommitted: per buying asset, the total amount the account will
+ *                   receive if every offer fills (amount × price)
+ *
+ * oldestOfferAgeDays is measured from each offer's `last_modified_time`;
+ * Horizon does not expose a creation time, so updating an offer resets its
+ * age. It is null when the account has no open offers.
  *
  * Responses are cached per account (X-Cache: HIT | MISS). Pass ?fresh=true
  * to bypass the cache.
@@ -6038,10 +8122,15 @@ router.get("/:id/payment-counterparty-risk", async (req, res, next) => {
  * Response shape:
  *   {
  *     accountId: string,
- *     offerCount: number,
- *     assets: [{ asset, sellLocked, buyCommitted }],  // seven-decimal strings
+ *     totalOffers: number,
+ *     sellLocked:   [{ asset, totalAmount }],  // seven-decimal strings, largest first
+ *     buyCommitted: [{ asset, totalAmount }],  // seven-decimal strings, largest first
  *     oldestOfferAgeDays: number | null
  *   }
+ *
+ * Errors:
+ *   400 — invalid account ID
+ *   404 — account does not exist
  *
  * @example
  * GET /account/GABC.../offers-summary
@@ -6062,42 +8151,35 @@ router.get("/:id/offers-summary", async (req, res, next) => {
       }
     }
 
-    await withHorizonTiming(req, () => server.loadAccount(id));
+    // loadAccount rejects with a Horizon 404 for unknown accounts, which
+    // handleAccountNotFound turns into a structured AccountNotFound error.
+    const [, offers] = await Promise.all([
+      withHorizonTiming(req, () => server.loadAccount(id)),
+      fetchAllOffers(req, id),
+    ]);
 
-    const offersResponse = await server
-      .offers()
-      .forAccount(id)
-      .limit(200)
-      .order("desc")
-      .call();
-    const records = offersResponse.records || [];
-
-    const assetTotals = new Map();
-    const getEntry = (code, issuer, type) => {
-      const asset = normalizeAsset(code, issuer, type);
-      const key = `${asset.code}:${asset.issuer}`;
-      if (!assetTotals.has(key)) {
-        assetTotals.set(key, { asset, sellLocked: 0, buyCommitted: 0 });
-      }
-      return assetTotals.get(key);
-    };
-
+    const sellTotals = new Map();
+    const buyTotals = new Map();
     let oldestOfferTime = null;
-    for (const offer of records) {
-      const amount = parseFloat(offer.amount || "0");
-      const price = parseFloat(offer.price || "0");
 
-      getEntry(
-        offer.selling_asset_code,
-        offer.selling_asset_issuer,
-        offer.selling_asset_type,
-      ).sellLocked += amount;
-      getEntry(
-        offer.buying_asset_code,
-        offer.buying_asset_issuer,
-        offer.buying_asset_type,
-      ).buyCommitted += amount * price;
+    for (const offer of offers) {
+      const amountStroops = amountToStroops(offer.amount);
+      const { n, d } = offerPriceRatio(offer);
+      // amount × n / d, rounded half-up to the nearest stroop
+      const committedStroops = (amountStroops * n * 2n + d) / (2n * d);
 
+      addAssetTotal(
+        sellTotals,
+        normalizeAsset(offer.selling_asset_code, offer.selling_asset_issuer, offer.selling_asset_type),
+        amountStroops,
+      );
+      addAssetTotal(
+        buyTotals,
+        normalizeAsset(offer.buying_asset_code, offer.buying_asset_issuer, offer.buying_asset_type),
+        committedStroops,
+      );
+
+      // new Date(null) is the epoch, not NaN, so a missing time must be skipped explicitly.
       const modified = offer.last_modified_time
         ? new Date(offer.last_modified_time).getTime()
         : NaN;
@@ -6108,21 +8190,222 @@ router.get("/:id/offers-summary", async (req, res, next) => {
 
     const data = {
       accountId: id,
-      offerCount: records.length,
-      assets: Array.from(assetTotals.values()).map((entry) => ({
-        asset: entry.asset,
-        sellLocked: toSevenDecimalString(entry.sellLocked),
-        buyCommitted: toSevenDecimalString(entry.buyCommitted),
-      })),
+      totalOffers: offers.length,
+      sellLocked: formatAssetTotals(sellTotals),
+      buyCommitted: formatAssetTotals(buyTotals),
       oldestOfferAgeDays:
         oldestOfferTime === null
           ? null
-          : Math.floor((Date.now() - oldestOfferTime) / (1000 * 60 * 60 * 24)),
+          : Math.floor((Date.now() - oldestOfferTime) / MS_PER_DAY),
     };
 
     cacheService.set(cacheKey, data, CACHE_TTL_ACCOUNT);
     res.set("X-Cache", "MISS");
     return success(res, data);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+const HEATMAP_DAY_NAMES = [
+  "sunday",
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday",
+];
+
+const ACTIVITY_HEATMAP_PAGE_SIZE = 200;
+const ACTIVITY_HEATMAP_MAX_PAGES = 10;
+
+/**
+ * GET /account/:id/activity-heatmap?days=30
+ *
+ * Returns a 7x24 matrix of transaction counts by day of week and hour of day
+ * (UTC), computed from the account's recent transaction history.
+ *
+ * Query params:
+ *   - days (integer, default: 30) — lookback window in days
+ *
+ * Response shape:
+ *   {
+ *     accountId,
+ *     heatmap: { monday: [24 numbers], ..., sunday: [24 numbers] },
+ *     peakDay: string | null,
+ *     peakHour: number | null,
+ *     totalAnalysed: number
+ *   }
+ *
+ * Returns 404 when the account does not exist.
+ *
+ * @example
+ * GET /account/GABC.../activity-heatmap?days=7
+ */
+router.get("/:id/activity-heatmap", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const DEFAULT_DAYS = 30;
+    let days = DEFAULT_DAYS;
+    if (req.query.days !== undefined) {
+      const parsed = parseInt(req.query.days, 10);
+      if (isNaN(parsed) || parsed < 1 || String(parsed) !== String(req.query.days).trim()) {
+        const err = new Error(
+          "Query parameter 'days': must be a positive integer.",
+        );
+        err.isValidation = true;
+        err.field = "days";
+        err.receivedValue = String(req.query.days);
+        err.expectedFormat = "positive integer";
+        throw err;
+      }
+      days = parsed;
+    }
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const since = Date.now() - days * 24 * 60 * 60 * 1000;
+
+    const heatmap = {};
+    for (const dayName of HEATMAP_DAY_NAMES) {
+      heatmap[dayName] = new Array(24).fill(0);
+    }
+
+    let totalAnalysed = 0;
+    let cursor;
+    let reachedEnd = false;
+
+    for (
+      let page = 0;
+      page < ACTIVITY_HEATMAP_MAX_PAGES && !reachedEnd;
+      page++
+    ) {
+      let query = server
+        .transactions()
+        .forAccount(id)
+        .order("desc")
+        .limit(ACTIVITY_HEATMAP_PAGE_SIZE);
+      if (cursor) query = query.cursor(cursor);
+
+      const response = await withHorizonTiming(req, () => query.call());
+      const records = response.records || [];
+
+      for (const tx of records) {
+        cursor = tx.paging_token;
+        const createdAt = new Date(tx.created_at).getTime();
+        if (!Number.isFinite(createdAt) || createdAt < since) {
+          reachedEnd = true;
+          break;
+        }
+        const date = new Date(createdAt);
+        const dayName = HEATMAP_DAY_NAMES[date.getUTCDay()];
+        const hour = date.getUTCHours();
+        heatmap[dayName][hour] += 1;
+        totalAnalysed += 1;
+      }
+
+      if (records.length < ACTIVITY_HEATMAP_PAGE_SIZE) reachedEnd = true;
+    }
+
+    let peakDay = null;
+    let peakHour = null;
+    let peakCount = 0;
+    for (const dayName of HEATMAP_DAY_NAMES) {
+      const hours = heatmap[dayName];
+      for (let hour = 0; hour < 24; hour++) {
+        if (hours[hour] > peakCount) {
+          peakCount = hours[hour];
+          peakDay = dayName;
+          peakHour = hour;
+        }
+      }
+    }
+
+    return success(res, {
+      accountId: id,
+      heatmap,
+      peakDay,
+      peakHour,
+      totalAnalysed,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/asset-diversity
+ *
+ * Measures how diversified an account's asset holdings are using the
+ * Herfindahl-Hirschman Index (HHI) of portfolio weights.
+ *
+ * diversityLevel:
+ *   - "concentrated" when HHI > 2500
+ *   - "moderate"     when 1000 <= HHI <= 2500
+ *   - "diversified"  when HHI < 1000
+ *
+ * Response shape:
+ *   {
+ *     accountId,
+ *     assetCount,
+ *     hhi,
+ *     diversityLevel,
+ *     breakdown: [{ asset, portfolioPercent }]
+ *   }
+ *
+ * Returns 404 when the account does not exist.
+ *
+ * @example
+ * GET /account/GABC.../asset-diversity
+ */
+router.get("/:id/asset-diversity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const holdings = [];
+    for (const balance of account.balances || []) {
+      const value = parseFloat(balance.balance || "0");
+      if (!Number.isFinite(value) || value <= 0) continue;
+      holdings.push({
+        asset: normalizeAssetShape(balance),
+        value,
+      });
+    }
+
+    const totalValue = holdings.reduce((sum, h) => sum + h.value, 0);
+
+    const breakdown = holdings.map((h) => ({
+      asset: h.asset,
+      portfolioPercent:
+        totalValue > 0
+          ? Math.round((h.value / totalValue) * 10000) / 100
+          : 0,
+    }));
+
+    let hhi = 0;
+    for (const entry of breakdown) {
+      hhi += entry.portfolioPercent * entry.portfolioPercent;
+    }
+    hhi = Math.round(hhi * 100) / 100;
+
+    let diversityLevel;
+    if (hhi > 2500) diversityLevel = "concentrated";
+    else if (hhi >= 1000) diversityLevel = "moderate";
+    else diversityLevel = "diversified";
+
+    return success(res, {
+      accountId: id,
+      assetCount: breakdown.length,
+      hhi,
+      diversityLevel,
+      breakdown,
+    });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
@@ -6153,11 +8436,13 @@ router.get("/:id/watchlist-status", async (req, res, next) => {
 
     await withHorizonTiming(req, () => server.loadAccount(id));
 
+    const result = (await watchlistService.checkWatchlist(id)) || {};
+
     const data = {
       accountId: id,
-      onWatchlist: false,
-      sources: [],
-      reason: null,
+      onWatchlist: Boolean(result.onWatchlist),
+      sources: Array.isArray(result.sources) ? result.sources : [],
+      reason: result.reason ?? null,
       checkedAt: new Date().toISOString(),
     };
 
@@ -6540,6 +8825,369 @@ router.get("/:id/smart-contract-interactions", async (req, res, next) => {
       total: interactions.length,
       limit,
       cursor: nextCursor || null,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/fee-spending
+ *
+ * Aggregates network fees paid by an account over a specified time period.
+ * Returns total fees in stroops and XLM, average fee per transaction, and a
+ * breakdown by operation type.
+ *
+ * Query params:
+ *   - days (integer, 1–90, default: 30) — how many days of history to analyze
+ *
+ * Response:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId,
+ *       period: { days, startDate, endDate },
+ *       totalFeesStroops: "123456",
+ *       totalFeesXLM: "0.0123456",
+ *       averageFeeXLM: "0.0001000",
+ *       transactionCount: 123,
+ *       breakdown: [
+ *         { operationType: "payment", count: 50, totalFeesXLM: "0.0050000" },
+ *         { operationType: "manage_offer", count: 30, totalFeesXLM: "0.0030000" },
+ *         ...
+ *       ]
+ *     }
+ *   }
+ *
+ * Errors:
+ *   - 400: InvalidParameter — days is not a valid integer or out of range
+ *   - 404: AccountNotFound — account does not exist on the network
+ *
+ * @example
+ * GET /account/GABC.../fee-spending?days=7
+ */
+router.get("/:id/fee-spending", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    // Validate days parameter
+    const rawDays = req.query.days;
+    let days = 30;
+    if (rawDays !== undefined) {
+      const parsed = Number(rawDays);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 90) {
+        const err = new Error("Parameter 'days' must be an integer between 1 and 90.");
+        err.isValidation = true;
+        err.status = 400;
+        err.field = "days";
+        err.receivedValue = rawDays;
+        throw err;
+      }
+      days = parsed;
+    }
+
+    // Verify account exists
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const now = Date.now();
+    const windowStart = now - (days * 24 * 60 * 60 * 1000);
+    const startDate = new Date(windowStart).toISOString();
+    const endDate = new Date(now).toISOString();
+
+    let totalFeesStroops = 0n;
+    let transactionCount = 0;
+    const breakdownMap = new Map(); // operationType -> { count, totalFees }
+    let cursor;
+
+    // Paginate through transactions
+    for (;;) {
+      let query = server
+        .transactions()
+        .forAccount(id)
+        .limit(200)
+        .order("desc");
+      
+      if (cursor) query = query.cursor(cursor);
+
+      const page = await withHorizonTiming(req, () => query.call());
+      const records = page.records || [];
+
+      if (records.length === 0) break;
+
+      for (const tx of records) {
+        const createdAt = new Date(tx.created_at).getTime();
+        if (Number.isNaN(createdAt)) continue;
+        
+        // Stop if we've gone past the time window
+        if (createdAt < windowStart) {
+          cursor = null; // Signal we're done
+          break;
+        }
+
+        cursor = tx.paging_token;
+
+        // Only count successful transactions
+        if (tx.successful !== true) continue;
+
+        const fee = BigInt(tx.fee_charged || tx.max_fee || 0);
+        totalFeesStroops += fee;
+        transactionCount++;
+
+        // Get operation details for this transaction
+        try {
+          const opResponse = await withHorizonTiming(req, () =>
+            server.operations().forTransaction(tx.id).limit(200).call()
+          );
+
+          for (const op of opResponse.records || []) {
+            const opType = op.type || "unknown";
+            const existing = breakdownMap.get(opType) || { count: 0, totalFees: 0n };
+            existing.count++;
+            // Distribute the transaction fee evenly across operations
+            existing.totalFees += fee / BigInt(tx.operation_count || 1);
+            breakdownMap.set(opType, existing);
+          }
+        } catch (opErr) {
+          // If we can't get operations, just continue (edge case)
+          console.error(`Failed to fetch operations for tx ${tx.id}:`, opErr.message);
+        }
+      }
+
+      // If cursor is null, we've processed all relevant transactions
+      if (!cursor || records.length < 200) break;
+    }
+
+    // Convert breakdown map to array
+    const breakdown = Array.from(breakdownMap.entries())
+      .map(([operationType, data]) => ({
+        operationType,
+        count: data.count,
+        totalFeesXLM: stroopsToAmount(data.totalFees),
+      }))
+      .sort((a, b) => b.count - a.count); // Sort by count descending
+
+    const totalFeesXLM = stroopsToAmount(totalFeesStroops);
+    const averageFeeXLM = transactionCount > 0
+      ? stroopsToAmount(totalFeesStroops / BigInt(transactionCount))
+      : "0.0000000";
+
+    return success(res, {
+      accountId: id,
+      period: {
+        days,
+        startDate,
+        endDate,
+      },
+      totalFeesStroops: totalFeesStroops.toString(),
+      totalFeesXLM,
+      averageFeeXLM,
+      transactionCount,
+      breakdown,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/self-payment-detection
+ *
+ * Analyses recent payment history and flags:
+ *   - "direct_self"   : sender and recipient share at least one signing key
+ *   - "circular_chain": a payment chain that returns value to the originating
+ *                       account within 10 hops
+ *
+ * Response:
+ *   { success: true, data: { accountId, selfPaymentsDetected, patterns: [{ type, txHash, amount, asset, timestamp }] } }
+ */
+router.get("/:id/self-payment-detection", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    // Verify account exists and get its signers
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+    const accountSigners = new Set((account.signers || []).map((s) => s.key));
+
+    // Fetch recent payments (up to 200)
+    const paymentsResponse = await withHorizonTiming(req, () =>
+      server.payments().forAccount(id).limit(200).order("desc").call()
+    );
+    const payments = paymentsResponse.records || [];
+
+    const patterns = [];
+
+    // Build a map of visited accounts for circular chain detection
+    for (const op of payments) {
+      if (op.transaction_successful === false) continue;
+      if (op.type !== "payment" && op.type !== "path_payment_strict_send" && op.type !== "path_payment_strict_receive") continue;
+
+      const from = op.from || op.funder;
+      const to = op.to || op.account;
+      if (!from || !to) continue;
+
+      const assetType = op.asset_type || "native";
+      const asset = isNativeAsset({ type: assetType })
+        ? { code: "XLM", issuer: null, type: "native" }
+        : { code: op.asset_code || null, issuer: op.asset_issuer || null, type: assetType };
+      const amount = op.amount || op.starting_balance || "0";
+
+      // Direct self-payment: sender and recipient share signing keys
+      if (from !== to) {
+        try {
+          const counterparty = from === id ? to : from;
+          const counterpartyAccount = await server.loadAccount(counterparty);
+          const counterpartySigners = new Set((counterpartyAccount.signers || []).map((s) => s.key));
+          const sharedKeys = [...accountSigners].filter((k) => counterpartySigners.has(k));
+          if (sharedKeys.length > 0) {
+            patterns.push({
+              type: "direct_self",
+              txHash: op.transaction_hash,
+              amount,
+              asset,
+              timestamp: op.created_at,
+            });
+            continue;
+          }
+        } catch (_) {
+          // counterparty not found or unreachable — skip
+        }
+      }
+
+      // Direct self-payment: sender === recipient
+      if (from === id && to === id) {
+        patterns.push({
+          type: "direct_self",
+          txHash: op.transaction_hash,
+          amount,
+          asset,
+          timestamp: op.created_at,
+        });
+        continue;
+      }
+
+      // Circular chain detection: trace payment path up to 10 hops
+      if (from === id) {
+        // Walk the chain: id → to → ... → id?
+        const visited = new Set([id]);
+        let current = to;
+        let hops = 0;
+        let isCircular = false;
+        while (hops < 10 && current && !visited.has(current)) {
+          visited.add(current);
+          hops++;
+          // Find an outbound payment from `current` to another account in our payments list
+          const next = payments.find(
+            (p) =>
+              p.transaction_successful !== false &&
+              (p.from === current || p.funder === current) &&
+              p.transaction_hash !== op.transaction_hash
+          );
+          if (!next) break;
+          const nextTo = next.to || next.account;
+          if (nextTo === id) {
+            isCircular = true;
+            break;
+          }
+          current = nextTo;
+        }
+        if (isCircular) {
+          patterns.push({
+            type: "circular_chain",
+            txHash: op.transaction_hash,
+            amount,
+            asset,
+            timestamp: op.created_at,
+          });
+        }
+      }
+    }
+
+    return success(res, {
+      accountId: id,
+      selfPaymentsDetected: patterns.length > 0,
+      patterns,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/operation-type-breakdown
+ *
+ * Returns a breakdown of all operations by type with count and percentage of total.
+ * Sorted by count descending.
+ *
+ * Query params:
+ *   - days (integer, 1–90, default: 30) — how many days of history to analyse
+ *
+ * Response:
+ *   { success: true, data: { accountId, totalOperations, breakdown: [{ type, count, percent }] } }
+ */
+router.get("/:id/operation-type-breakdown", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    // Validate ?days= param
+    const rawDays = req.query.days;
+    let days = 30;
+    if (rawDays !== undefined) {
+      const parsed = Number(rawDays);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 90) {
+        const err = new Error("Query parameter 'days': must be an integer between 1 and 90.");
+        err.isValidation = true;
+        err.status = 400;
+        err.field = "days";
+        err.receivedValue = String(rawDays);
+        err.expectedFormat = "1–90";
+        throw err;
+      }
+      days = parsed;
+    }
+
+    // Verify account exists
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const typeCounts = new Map();
+    let cursor;
+    const MAX_PAGES = 10;
+
+    for (let page = 0; page < MAX_PAGES; page++) {
+      let query = server.operations().forAccount(id).limit(200).order("desc");
+      if (cursor) query = query.cursor(cursor);
+      const response = await withHorizonTiming(req, () => query.call());
+      const records = response.records || [];
+      let reachedEnd = false;
+      for (const op of records) {
+        cursor = op.paging_token;
+        if (new Date(op.created_at) < since) {
+          reachedEnd = true;
+          break;
+        }
+        const type = op.type || "unknown";
+        typeCounts.set(type, (typeCounts.get(type) || 0) + 1);
+      }
+      if (reachedEnd || records.length < 200) break;
+    }
+
+    const totalOperations = [...typeCounts.values()].reduce((s, c) => s + c, 0);
+
+    const breakdown = [...typeCounts.entries()]
+      .map(([type, count]) => ({
+        type,
+        count,
+        percent: totalOperations > 0 ? parseFloat(((count / totalOperations) * 100).toFixed(2)) : 0,
+      }))
+      .sort((a, b) => b.count - a.count);
+
+    return success(res, {
+      accountId: id,
+      totalOperations,
+      breakdown,
     });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
@@ -7008,6 +9656,18 @@ router.get("/:id/balance-velocity", async (req, res, next) => {
       });
     }
 
+    const cacheKey = `balance-velocity:${id}`;
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+
+    // Check cache first (unless fresh=true)
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
     // Check if account exists and get current balances
     let account;
     try {
@@ -7126,6 +9786,10 @@ router.get("/:id/balance-velocity", async (req, res, next) => {
       accountId: id,
       balanceChanges: result,
     };
+
+    // Cache the result
+    cacheService.set(cacheKey, data, cacheTTL.balanceVelocity);
+    res.set("X-Cache", "MISS");
 
     return success(res, data);
   } catch (err) {

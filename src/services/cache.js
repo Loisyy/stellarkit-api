@@ -1,5 +1,6 @@
 const NodeCache = require("node-cache");
 const logger = require("../utils/logger");
+const { getCoalescedRequests } = require("../utils/singleFlight");
 
 // LRU cache enforcement constants
 const CACHE_MAX_ENTRIES = parseInt(process.env.CACHE_MAX_ENTRIES, 10) || 5000;
@@ -56,10 +57,23 @@ class CacheService {
     });
     this.hits = 0;
     this.misses = 0;
-    // Counts entries removed via `delete()` (forced eviction), and LRU evictions
-    // triggered when cache reaches CACHE_MAX_ENTRIES capacity.
-    // Separate from natural TTL expiry which node-cache handles internally.
+    // Counts entries removed via `delete()` (forced eviction), separate from
+    // natural TTL expiry which node-cache handles internally and never routes
+    // through this method.
     this.evictions = 0;
+
+    // Opt-in stale-while-revalidate window (milliseconds). 0 disables SWR.
+    // Configured through CACHE_SWR_MS; see src/config/cacheConfig.js.
+    const configuredSwr = parseInt(process.env.CACHE_SWR_MS, 10);
+    this.swrMs = Number.isFinite(configuredSwr) && configuredSwr > 0 ? configuredSwr : 0;
+
+    // SWR metadata kept outside node-cache: node-cache drops entries at their
+    // TTL, so we store the value for ttl + swrMs and track the real freshness
+    // deadline ourselves. In-flight refreshes are tracked per key so exactly
+    // one background refresh runs for a stale entry.
+    this.swrMeta = new Map();
+    this.swrInflight = new Set();
+
     // Track last access time for each key to enable LRU eviction
     this.accessOrder = new Map();
   }
@@ -74,8 +88,6 @@ class CacheService {
    * Debug-level logs are emitted outside of the test environment so
    * cache behaviour is observable during development without polluting
    * test output.
-   *
-   * On a hit, the access order is updated to track LRU eviction.
    *
    * @param {string} key - The cache key (see key format convention above).
    * @returns {any|undefined} The cached value, or `undefined` on a miss.
@@ -160,11 +172,111 @@ class CacheService {
     if (oldestKey !== null) {
       this.cache.del(oldestKey);
       this.accessOrder.delete(oldestKey);
+      this.swrMeta.delete(oldestKey);
       this.evictions++;
       if (process.env.NODE_ENV !== "test") {
         logger.debug(`Cache evicted (LRU): ${oldestKey}`);
       }
     }
+  }
+
+  /**
+   * Store a value with a stale-while-revalidate window.
+   *
+   * The node-cache entry lives for `ttlSeconds + swrMs` while `swrMeta`
+   * remembers when the value actually became stale.
+   *
+   * @param {string} key        - Cache key.
+   * @param {any}    value      - Value to cache.
+   * @param {number} ttlSeconds - Fresh lifetime in seconds.
+   * @param {number} [swrMs]    - Stale window in milliseconds.
+   * @returns {boolean} True when stored.
+   */
+  setWithRevalidation(key, value, ttlSeconds, swrMs = this.swrMs) {
+    const windowMs = Number.isFinite(swrMs) && swrMs > 0 ? swrMs : 0;
+    this.swrMeta.set(key, {
+      expiresAt: Date.now() + ttlSeconds * 1000,
+      windowMs,
+    });
+    return this.cache.set(key, value, ttlSeconds + windowMs / 1000);
+  }
+
+  /**
+   * Read a value with opt-in stale-while-revalidate support.
+   *
+   * Returns one of three states:
+   *   - `HIT`: inside the fresh TTL.
+   *   - `STALE`: past TTL but inside the SWR window; the stale value is served
+   *     immediately while exactly one background refresh runs for this key.
+   *   - `MISS`: no usable value.
+   *
+   * A failed background refresh keeps the stale value until the window closes
+   * and logs a warning; it never throws into the request path.
+   *
+   * @param {string} key          - Cache key.
+   * @param {number} ttlSeconds   - Fresh lifetime in seconds.
+   * @param {Function} refresh    - Async function returning a fresh value.
+   * @param {number} [swrMs]      - Stale window in milliseconds (0 disables SWR).
+   * @returns {{ state: "HIT"|"STALE"|"MISS", value: any }}
+   */
+  getWithRevalidation(key, ttlSeconds, refresh, swrMs = this.swrMs) {
+    const windowMs = Number.isFinite(swrMs) && swrMs > 0 ? swrMs : 0;
+    const value = this.cache.get(key);
+
+    if (value === undefined) {
+      this.swrMeta.delete(key);
+      this.misses++;
+      if (process.env.NODE_ENV !== "test") logger.debug(`Cache miss: ${key}`);
+      return { state: "MISS", value: undefined };
+    }
+
+    this.hits++;
+    if (process.env.NODE_ENV !== "test") logger.debug(`Cache hit: ${key}`);
+
+    const meta = this.swrMeta.get(key);
+    const now = Date.now();
+
+    if (windowMs === 0 || !meta || now < meta.expiresAt) {
+      return { state: "HIT", value };
+    }
+
+    if (now <= meta.expiresAt + windowMs) {
+      this.startBackgroundRefresh(key, value, ttlSeconds, refresh, windowMs);
+      return { state: "STALE", value };
+    }
+
+    // Window closed — discard the stale entry and force a synchronous fetch.
+    this.cache.del(key);
+    this.swrMeta.delete(key);
+    this.misses++;
+    return { state: "MISS", value: undefined };
+  }
+
+  /**
+   * Start (or reuse) the single in-flight refresh for a stale key.
+   *
+   * @private
+   */
+  startBackgroundRefresh(key, staleValue, ttlSeconds, refresh, windowMs) {
+    if (this.swrInflight.has(key)) return;
+
+    this.swrInflight.add(key);
+    Promise.resolve()
+      .then(() => refresh())
+      .then((freshValue) => {
+        if (freshValue !== undefined) {
+          this.setWithRevalidation(key, freshValue, ttlSeconds, windowMs);
+        }
+      })
+      .catch((err) => {
+        // Keep the stale value until the window closes.
+        logger.warn(
+          `Background cache refresh failed for ${key}: ${err && err.message ? err.message : "unknown error"}`,
+        );
+      })
+      .finally(() => {
+        this.swrInflight.delete(key);
+      });
   }
 
   /**
@@ -178,6 +290,7 @@ class CacheService {
    */
   delete(key) {
     this.cache.del(key);
+    this.swrMeta.delete(key);
     this.accessOrder.delete(key);
     this.evictions++;
   }
@@ -192,6 +305,8 @@ class CacheService {
   flush() {
     this.cache.flushAll();
     this.accessOrder.clear();
+    this.swrMeta.clear();
+    this.swrInflight.clear();
   }
 
   /**
@@ -203,7 +318,7 @@ class CacheService {
    *
    * `evictions` counts both LRU-triggered evictions and manual deletes.
    *
-   * @returns {{ hits: number, misses: number, hitRate: string, cachedKeys: number, evictions: number }}
+   * @returns {{ hits: number, misses: number, hitRate: string, cachedKeys: number, evictions: number, coalescedRequests: number }}
    */
   getStats() {
     const total = this.hits + this.misses;
@@ -215,6 +330,8 @@ class CacheService {
       // Number of keys that are currently live (not yet expired or deleted)
       cachedKeys: this.cache.keys().length,
       evictions: this.evictions,
+      // Requests that shared an upstream call via src/utils/singleFlight.js
+      coalescedRequests: getCoalescedRequests(),
     };
   }
 }
