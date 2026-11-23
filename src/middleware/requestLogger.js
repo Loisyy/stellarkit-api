@@ -10,6 +10,8 @@
  * helpers exported below so this middleware can include horizonResponseTimeMs
  * in the log entry. Routes that serve from cache omit the field entirely.
  *
+ * SDK version is logged when present (via X-StellarKit-SDK header).
+ *
  * Usage in a route handler:
  *   const { startHorizonTimer, stopHorizonTimer } = require("../middleware/requestLogger");
  *   startHorizonTimer(req);
@@ -19,6 +21,34 @@
 
 const logger = require("../utils/logger");
 const metricsService = require("../services/metrics");
+
+/**
+ * Validate and extract SDK version from X-StellarKit-SDK header.
+ * Valid format: name/major.minor.patch[-+prerelease]
+ * Maximum length: 64 characters
+ *
+ * @param {string} headerValue - The header value to validate
+ * @returns {string|null} The validated SDK version, or null if invalid
+ */
+function validateSdkHeader(headerValue) {
+  if (!headerValue || typeof headerValue !== "string") {
+    return null;
+  }
+
+  // Max length: 64 characters
+  if (headerValue.length > 64) {
+    return null;
+  }
+
+  // Pattern: alphanumeric/digits/dots/hyphens/plus, with version semver format
+  // Example: stellarkit-js/1.0.0, stellarkit-js/1.0.0-beta, stellarkit-py/1.2.3+build
+  const pattern = /^[\w.-]+\/\d+\.\d+\.\d+([-+][\w.]+)?$/;
+  if (!pattern.test(headerValue)) {
+    return null;
+  }
+
+  return headerValue;
+}
 
 /**
  * Record the start of a Horizon call on the request object.
@@ -61,6 +91,15 @@ function requestLogger(req, res, next) {
     const statusCode = res.statusCode;
 
     const fields = { requestId, method, path, statusCode, responseTimeMs };
+
+    // Extract and validate SDK version header
+    const sdkHeader = req.get("X-StellarKit-SDK");
+    if (sdkHeader) {
+      const validatedSdk = validateSdkHeader(sdkHeader);
+      if (validatedSdk) {
+        fields.sdkVersion = validatedSdk;
+      }
+    }
 
     // Only include horizonResponseTimeMs when the request actually called
     // Horizon — cache hits and non-Horizon routes will not have this field.

@@ -208,6 +208,7 @@ if (allowedOriginsEnv) {
         cors({
           origin: (originVal, callback) => callback(null, true),
           credentials: true,
+          allowedHeaders: ["Content-Type", "X-API-Key", "X-StellarKit-SDK"],
         })(req, res, next);
       } else {
         return res.status(403).json({
@@ -223,7 +224,9 @@ if (allowedOriginsEnv) {
     }
   });
 } else {
-  app.use(cors());
+  app.use(cors({
+    allowedHeaders: ["Content-Type", "X-API-Key", "X-StellarKit-SDK"],
+  }));
 }
 app.use(requestIdMiddleware);
 app.use(requestLogger);

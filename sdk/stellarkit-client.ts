@@ -94,6 +94,9 @@ export class StellarKitClient {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       "Accept": "application/json",
+      // SDK identification header for server-side logging and monitoring
+      // Format: name/semver (e.g., stellarkit-js/1.0.0)
+      "X-StellarKit-SDK": `stellarkit-js/${(globalThis as any).STELLARKIT_VERSION || "1.0.0"}`,
     };
 
     if (this.apiKey) {
